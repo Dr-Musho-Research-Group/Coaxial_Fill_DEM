@@ -282,6 +282,7 @@ static std::array<SizeDist,4> g_types = {};
 // Composition (fractions); will be normalized at runtime
 //                             La       Sr      Fe      Co
 static real g_type_frac[4] = {0.4667, 0.2020, 0.2945, 0.0368};
+static real g_diameter_scale_factor = 1.0;
 
 // Optional: per-type density (defaults to global density)
 static real g_density_type[4] = {0,0,0,0}; // 0 => use g_density
@@ -557,13 +558,13 @@ real sample_diameter_for_type(std::mt19937& rng, int type_id){
         real r = U(rng);
         size_t i=0; for(; i<C0.size(); ++i) if (r < C0[i]) break;
         if(i>=D0.size()) i = D0.size()-1;
-        return 1e-6f * D0[i];
+        return g_diameter_scale_factor * (1e-6f * D0[i]);
     }
     std::uniform_real_distribution<real> U(0.0,1.0);
     real r = U(rng);
     size_t i=0; for(; i<C.size(); ++i) if (r < C[i]) break;
     if(i>=D.size()) i = D.size()-1;
-    return 1e-6f * D[i];
+    return g_diameter_scale_factor * (1e-6f * D[i]);
 }
 
 // (legacy wrapper – kept for compatibility; uses type 0)
@@ -584,7 +585,7 @@ static inline void successive_damping(std::vector<Particle>& P, real top_z)
     if (g_sd_sweeps <= 0) return;
 
     // do not overdamp fresh injectees just above the top plane
-    real max_diam = 1e-6 * max_diam_from_types_um();
+    real max_diam = g_diameter_scale_factor * (1e-6 * max_diam_from_types_um());
     max_diam += 2.0 * g_cushion;
     // account for effective collision diameter inflation from cushion
     const real z_guard  = top_z + g_sd_top_guardD * max_diam;
@@ -1412,6 +1413,7 @@ int main(int argc, char** argv){
     g_ram_speed = 0.0;
 
     g_phi_target = 0.0;
+    g_diameter_scale_factor = 1.0;
 
     g_stop_vrms = 0.0;
     g_stop_vmax = 0.0;
@@ -1541,6 +1543,15 @@ int main(int argc, char** argv){
         get_r("ram_duration", g_ram_dt);
         get_r("ram_speed", g_ram_speed);
         get_r("phi_target", g_phi_target);
+        get_r("diameter_scale_factor", g_diameter_scale_factor);
+        get_r("diameter_scale", g_diameter_scale_factor);
+        get_r("diam_scale", g_diameter_scale_factor);
+        get_r("dsf", g_diameter_scale_factor);
+
+        get_r("f_la", g_type_frac[0]);
+        get_r("f_sr", g_type_frac[1]);
+        get_r("f_fe", g_type_frac[2]);
+        get_r("f_co", g_type_frac[3]);
 
         get_r("repulse_range", g_repulse_range);
         get_r("repulse_k_pp",  g_repulse_k_pp);
@@ -1599,14 +1610,19 @@ int main(int argc, char** argv){
     // init multi-type defaults (copies type 0 into 1..3 unless you override)
 init_default_distributions_once();
     // normalize fractions once; allow user to set g_type_frac[] later
+    for (int itype = 0; itype < 4; ++itype) {
+        if (g_type_frac[itype] < 0.0) g_type_frac[itype] = 0.0;
+    }
     real fsum = g_type_frac[0] + g_type_frac[1] + g_type_frac[2] + g_type_frac[3];
     if (fsum <= 0) { g_type_frac[0]=1.0; g_type_frac[1]=g_type_frac[2]=g_type_frac[3]=0.0; fsum=1.0; }
+    for (int itype = 0; itype < 4; ++itype) g_type_frac[itype] /= fsum;
+    if (g_diameter_scale_factor <= 0.0) g_diameter_scale_factor = 1.0;
 
     if (g_seed<=0) g_seed = int(std::time(nullptr));
     std::mt19937 rng(g_seed);
 
     // domain bbox for neighbor grid
-    real max_diam = 1e-6 * max_diam_from_types_um();
+    real max_diam = g_diameter_scale_factor * (1e-6 * max_diam_from_types_um());
     max_diam += 2.0 * g_cushion;
     // account for effective collision diameter inflation from cushion
     g_cell_h = std::max(max_diam, 0.5*max_diam) * 1.05; // start near 1.05*D
@@ -1660,6 +1676,8 @@ init_default_distributions_once();
 
     std::printf("Coax pack: Rin=%.4g m Rout=%.4g m L=%.4g m, fill_time=%.2fs, flux=%d 1/s\n",
                 g_Rin, g_Rout, g_L, g_fill_time, g_flux);
+    std::printf("Diameter scale factor=%.6g | Fractions (La,Sr,Fe,Co)=(%.6g, %.6g, %.6g, %.6g)\n",
+                g_diameter_scale_factor, g_type_frac[0], g_type_frac[1], g_type_frac[2], g_type_frac[3]);
 
     for (int it=0; it<=g_niter; ++it, t += g_dt){
         // 1) Inject new spheres while t < fill_time
@@ -1775,7 +1793,7 @@ init_default_distributions_once();
         }
         {
             // Gentle local relaxation for recently injected particles (avoid float suffixes)
-            real max_diam = 1e-6 * max_diam_from_types_um();
+            real max_diam = g_diameter_scale_factor * (1e-6 * max_diam_from_types_um());
             max_diam += 2.0 * g_cushion;
             // account for effective collision diameter inflation from cushion
             real z_thresh = g_L + 0.5 * max_diam; // consider particles placed above top plane
@@ -1952,7 +1970,7 @@ init_default_distributions_once();
             a.prev_p = a.p; // update history every step
         }
 #else
-        struct IntegrateCtx { std::vector<Particle>* P; real zTop; };
+        struct IntegrateCtx { std::vector<Particle>* P; real zTop; real v_damp_fac; };
         auto integ_worker = [](int i, void* vctx){
             IntegrateCtx* c = (IntegrateCtx*)vctx;
             auto &a = (*(c->P))[i];
@@ -1961,9 +1979,9 @@ init_default_distributions_once();
                 a.v.x += a.a.x * g_dt;
                 a.v.y += a.a.y * g_dt;
                 a.v.z += a.a.z * g_dt;
-                a.v.x *= v_damp_fac;
-                a.v.y *= v_damp_fac;
-                a.v.z *= v_damp_fac;
+                a.v.x *= c->v_damp_fac;
+                a.v.y *= c->v_damp_fac;
+                a.v.z *= c->v_damp_fac;
                 a.p.x += a.v.x * g_dt;
                 a.p.y += a.v.y * g_dt;
                 a.p.z += a.v.z * g_dt;
@@ -2000,7 +2018,7 @@ init_default_distributions_once();
 
             a.prev_p = a.p;
         };
-        IntegrateCtx ctxI{&P, zTop};
+        IntegrateCtx ctxI{&P, zTop, v_damp_fac};
         for (int i = 0; i < (int)P.size(); ++i) integ_worker(i, &ctxI);
 #endif
 
