@@ -51,6 +51,7 @@
 #include <array>
 #include <limits>
 #include <cstdint>
+#include <cstdarg>
 
 #include <unordered_map>
 #include <cctype>
@@ -85,6 +86,39 @@ static inline void apply_thread_request(){
 #if defined(_OPENMP)
     if (g_threads > 0) omp_set_num_threads(g_threads);
 #endif
+}
+
+static FILE* g_run_log = nullptr;
+static std::string g_log_file_path;
+
+static inline void log_vfprintf(FILE* primary, const char* fmt, va_list ap){
+    va_list ap_primary;
+    va_copy(ap_primary, ap);
+    std::vfprintf(primary, fmt, ap_primary);
+    std::fflush(primary);
+    va_end(ap_primary);
+
+    if (g_run_log){
+        va_list ap_log;
+        va_copy(ap_log, ap);
+        std::vfprintf(g_run_log, fmt, ap_log);
+        std::fflush(g_run_log);
+        va_end(ap_log);
+    }
+}
+
+static inline void log_printf(const char* fmt, ...){
+    va_list ap;
+    va_start(ap, fmt);
+    log_vfprintf(stdout, fmt, ap);
+    va_end(ap);
+}
+
+static inline void log_eprintf(const char* fmt, ...){
+    va_list ap;
+    va_start(ap, fmt);
+    log_vfprintf(stderr, fmt, ap);
+    va_end(ap);
 }
 
 
@@ -774,6 +808,13 @@ inline void sample_injection_xy(std::mt19937& rng, real rp, real& x, real& y){
     y = r * std::sin(th);
 }
 
+inline bool injection_radius_fits(real rp){
+    const real rp_eff = rp + g_cushion;
+    const real Rin_eff  = g_Rin  + rp_eff;
+    const real Rout_eff = g_Rout - rp_eff;
+    return (Rout_eff > Rin_eff);
+}
+
 // build grid indexing helpers
 inline Vec3 worldMin(){ return g_minB; }
 inline int  idx3(int ix,int iy,int iz){ return (iz*gy + iy)*gx + ix; }
@@ -1383,8 +1424,11 @@ auto apply_wall_spring = [&](const Vec3& n, real pen, real wall_vn)
 
 // ----------------------- Integration Loop -------------------------
 int main(int argc, char** argv){
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+
     auto usage = [&](int rc){
-        std::fprintf(stderr,
+        log_eprintf(
             "Usage (legacy positional):\n"
             "  %s natoms_max dt niter dump_interval debug seed Rin Rout L flux g shake_hz shake_amp fill_time ram_start ram_duration ram_speed phi_target\n"
             "\n"
@@ -1402,6 +1446,7 @@ int main(int argc, char** argv){
 
             "     [--wall_rough_amp A] [--wall_rough_mth M] [--wall_rough_mz M]\n"
             "     [--threads N]\n"
+            "     [--log_file PATH]\n"
             "     [--xyz_interval N] [--vtk_interval N] [--vtk_domain_interval N] [--vtk_domain_segments N]\n",
             argv[0], argv[0]);
         return rc;
@@ -1520,12 +1565,16 @@ int main(int argc, char** argv){
         auto it = kv.find(k);
         if (it != kv.end()) dst = (real)std::atof(it->second.c_str());
     };
+    auto get_s = [&](const char* k, std::string& dst){
+        auto it = kv.find(k);
+        if (it != kv.end()) dst = it->second;
+    };
 
     // Legacy positional mode if any positional args were provided.
     // This preserves old scripts like: coax_pack_cpu.exe 20000 2e-6 ...
     if (!pos.empty()){
         if ((int)pos.size() < 18){
-            std::fprintf(stderr,"Error: legacy positional CLI expects 18 values (got %zu)\n", pos.size());
+            log_eprintf("Error: legacy positional CLI expects 18 values (got %zu)\n", pos.size());
             return usage(1);
         }
         int iarg=0;
@@ -1595,6 +1644,7 @@ int main(int argc, char** argv){
         get_r("dsf", g_diameter_scale_factor);
         get_i("adaptive_composition", g_adaptive_composition);
         get_i("adaptive_comp", g_adaptive_composition);
+        get_s("log_file", g_log_file_path);
 
         get_r("f_la", g_type_frac[0]);
         get_r("f_sr", g_type_frac[1]);
@@ -1627,6 +1677,15 @@ int main(int argc, char** argv){
         get_r("shake_ampx", g_shake_amp_x);
         get_r("shake_ampy", g_shake_amp_y);
         get_r("shake_ampz", g_shake_amp_z);
+    }
+
+    if (!g_log_file_path.empty()) {
+        g_run_log = std::fopen(g_log_file_path.c_str(), "w");
+        if (!g_run_log) {
+            std::perror("log_file");
+        } else {
+            std::setvbuf(g_run_log, nullptr, _IONBF, 0);
+        }
     }
 
     // If roughness is enabled, derive phases from the RNG seed so runs are repeatable.
@@ -1723,11 +1782,11 @@ init_default_distributions_once();
     int injected_total = 0;
     real t = 0.0;
 
-    std::printf("Coax pack: Rin=%.4g m Rout=%.4g m L=%.4g m, fill_time=%.2fs, flux=%d 1/s\n",
+    log_printf("Coax pack: Rin=%.4g m Rout=%.4g m L=%.4g m, fill_time=%.2fs, flux=%d 1/s\n",
                 g_Rin, g_Rout, g_L, g_fill_time, g_flux);
-    std::printf("Diameter scale factor=%.6g | Fractions (La,Sr,Fe,Co)=(%.6g, %.6g, %.6g, %.6g)\n",
+    log_printf("Diameter scale factor=%.6g | Fractions (La,Sr,Fe,Co)=(%.6g, %.6g, %.6g, %.6g)\n",
                 g_diameter_scale_factor, g_type_frac[0], g_type_frac[1], g_type_frac[2], g_type_frac[3]);
-    std::printf("Adaptive composition control=%d\n", g_adaptive_composition ? 1 : 0);
+    log_printf("Adaptive composition control=%d\n", g_adaptive_composition ? 1 : 0);
 
     for (int it=0; it<=g_niter; ++it, t += g_dt){
         // 1) Inject new spheres while t < fill_time
@@ -1747,7 +1806,7 @@ init_default_distributions_once();
                     P[i].asleep = false;
                     P[i].calm_steps = 0;
                 }
-                if (g_debug) std::printf("[phi-cutoff] target=%.5f reached at t=%.6g (N=%zu)\n",
+                if (g_debug) log_printf("[phi-cutoff] target=%.5f reached at t=%.6g (N=%zu)\n",
                                           g_phi_target, t, P.size());
             }
         }
@@ -1772,9 +1831,30 @@ init_default_distributions_once();
                     real planTotalVol = totalVol_running;
                     std::mt19937 plan_rng((unsigned)g_seed + 0x85EBCA6Bu + (unsigned)it*131u);
                     for (int k=0; k<want; ++k){
-                        const int t_id = sample_type_adaptive(plan_rng, domVol, planTotalVol, planTypeVol);
-                        const real d = sample_diameter_for_type(plan_rng, t_id);
-                        const real r = 0.5*d;
+                        int t_id = 0;
+                        real r = 0.0;
+                        bool planned = false;
+
+                        // Keep adaptive composition on the type choice, but resample diameters
+                        // until we find one that can actually fit in the annulus.
+                        for (int tries = 0; tries < 512 && !planned; ++tries){
+                            t_id = sample_type_adaptive(plan_rng, domVol, planTotalVol, planTypeVol);
+                            const real d = sample_diameter_for_type(plan_rng, t_id);
+                            r = 0.5*d;
+                            if (injection_radius_fits(r)) {
+                                planned = true;
+                            }
+                        }
+
+                        // Robust fallback: if repeated adaptive draws all fail to fit, switch to
+                        // legacy type sampling and keep drawing until a feasible radius appears.
+                        while (!planned){
+                            t_id = sample_type_fixed(plan_rng);
+                            const real d = sample_diameter_for_type(plan_rng, t_id);
+                            r = 0.5*d;
+                            if (injection_radius_fits(r)) planned = true;
+                        }
+
                         real rho = g_density;
                         if (t_id>=0 && t_id<4 && g_density_type[t_id] > 0.0) rho = g_density_type[t_id];
                         staged_type[k] = t_id;
@@ -2123,12 +2203,12 @@ init_default_distributions_once();
                 ok_checks = ok ? (ok_checks + 1) : 0;
 
                 if (g_debug) {
-                    std::printf("[stop-check] it=%d t=%.3g vrms=%.3g vmax=%.3g asleep=%.3f ok=%d (%d/%d)\n",
+                    log_printf("[stop-check] it=%d t=%.3g vrms=%.3g vmax=%.3g asleep=%.3f ok=%d (%d/%d)\n",
                                 it, t, vrms, vmax, sleep_frac, ok?1:0, ok_checks, g_stop_checks_required);
                 }
 
                 if (ok_checks >= std::max(1, g_stop_checks_required)) {
-                    std::printf("[early-stop] settled after phi_target: it=%d t=%.6g vrms=%.3g vmax=%.3g asleep=%.3f\n",
+                    log_printf("[early-stop] settled after phi_target: it=%d t=%.6g vrms=%.3g vmax=%.3g asleep=%.3f\n",
                                 it, t, vrms, vmax, sleep_frac);
                     break;
                 }
@@ -2153,11 +2233,15 @@ init_default_distributions_once();
             }
             // phi from running accumulator (cheap)
             phi = (domVol > 0.0 ? totalVol_running / domVol : 0.0);
-            std::printf("it=%d t=%.3g N=%zu topZ=%.4g avgZ=%.4g phi=%6.3f\n",
+            log_printf("it=%d t=%.3g N=%zu topZ=%.4g avgZ=%.4g phi=%6.3f\n",
                 it, t, P.size(), zTop, P.empty()?0.0:real(sumz/P.size()),phi);
         }
     }
 
-    std::printf("Done. Injected=%d, final N=%zu, phi=%6.3f\n", injected_total, P.size(), phi);
+    log_printf("Done. Injected=%d, final N=%zu, phi=%6.3f\n", injected_total, P.size(), phi);
+    if (g_run_log) {
+        std::fclose(g_run_log);
+        g_run_log = nullptr;
+    }
     return 0;
 }

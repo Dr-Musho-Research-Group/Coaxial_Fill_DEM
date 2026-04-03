@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -76,6 +77,7 @@ BASE_FLAGS: Dict[str, str] = {
     "ram_start": "0.0",
     "ram_duration": "0.0",
     "ram_speed": "0.0",
+    "adaptive_composition": "1",
     "vtk_interval": "1000",
     "vtk_domain_interval": "0",
     "vtk_domain_segments": "96",
@@ -141,12 +143,28 @@ def build_command(exe_path: Path, flags: Dict[str, str]) -> List[str]:
     return cmd
 
 
-def windows_quote(arg: str) -> str:
-    return subprocess.list2cmdline([arg])
-
-
 def command_to_text(cmd: List[str]) -> str:
     return subprocess.list2cmdline(cmd)
+
+
+def replace_flag_value(cmd: List[str], flag_name: str, value: str) -> List[str]:
+    out: List[str] = []
+    i = 0
+    while i < len(cmd):
+        if i + 1 < len(cmd) and cmd[i] == flag_name:
+            out.extend([flag_name, value])
+            i += 2
+            continue
+        out.append(cmd[i])
+        i += 1
+    return out
+
+
+def resolve_threads_value(raw_threads: str) -> str:
+    value = clean_cell(raw_threads)
+    if not value or value == "0":
+        return str(max(1, os.cpu_count() or 1))
+    return value
 
 
 def find_latest_atoms(case_dir: Path) -> Optional[Path]:
@@ -202,12 +220,33 @@ def write_case_files(case_dir: Path, case: Case, exe_path: Path) -> None:
 
     cmd = build_command(exe_path, case.flags)
     (case_dir / "command.txt").write_text(command_to_text(cmd) + "\n", encoding="utf-8")
+    log_name = "solver_output.log"
+    cmd_runtime = replace_flag_value(cmd, "--threads", "%THREADS_TO_USE%")
+    cmd_runtime_logged = list(cmd_runtime)
+    cmd_runtime_logged.extend(["--log_file", "%SOLVER_LOG%"])
+    solver_batch = case_dir / "solver_command.bat"
+    if solver_batch.exists():
+        solver_batch.unlink()
 
     bat_lines = [
         "@echo off",
         "setlocal",
         f'cd /d "%~dp0"',
-        command_to_text(cmd),
+        f'set "THREADS_TO_USE={case.flags["threads"]}"',
+        'if "%THREADS_TO_USE%"=="0" set "THREADS_TO_USE=%NUMBER_OF_PROCESSORS%"',
+        'if not defined THREADS_TO_USE set "THREADS_TO_USE=1"',
+        'if "%THREADS_TO_USE%"=="" set "THREADS_TO_USE=1"',
+        'set "OMP_NUM_THREADS=%THREADS_TO_USE%"',
+        'set "OMP_THREAD_LIMIT=%THREADS_TO_USE%"',
+        f'set "SOLVER_LOG=%CD%\\{log_name}"',
+        "echo ===============================================================",
+        f'echo Running case {case.run_id} in %CD%',
+        'echo Parallel processing enabled with %THREADS_TO_USE% threads',
+        'echo Live solver output will be shown in this console',
+        'echo Solver log: %SOLVER_LOG%',
+        "echo ===============================================================",
+        'if exist "%SOLVER_LOG%" del /q "%SOLVER_LOG%"',
+        command_to_text(cmd_runtime_logged),
         "set ERR=%ERRORLEVEL%",
         "if not %ERR%==0 exit /b %ERR%",
         "echo Done.",
@@ -216,11 +255,14 @@ def write_case_files(case_dir: Path, case: Case, exe_path: Path) -> None:
 
 
 def write_run_all(case_root: Path, case_folders: List[str]) -> None:
-    lines = ["@echo off", "setlocal"]
+    lines = ["@echo off", "setlocal", 'cd /d "%~dp0"', "echo Running all generated cases..."]
     for folder in case_folders:
+        lines.append("echo ===============================================================")
+        lines.append(f'echo Running {folder}...')
         lines.append(f'call "{folder}\\run_case.bat"')
         lines.append("if errorlevel 1 exit /b %ERRORLEVEL%")
     lines.append("echo All cases completed.")
+    lines.append('if exist "..\\run_verify_taguchi_cases.bat" echo To verify results, run ..\\run_verify_taguchi_cases.bat')
     (case_root / "run_all_cases.bat").write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
 
 
@@ -233,6 +275,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--python-cmd", default="py", help="Python launcher for optional postprocessing on Windows. Example: py or python.")
     parser.add_argument("--execute", action="store_true", help="Run each case after creating its folder.")
     parser.add_argument("--overwrite", action="store_true", help="Delete an existing case folder before regenerating it.")
+    parser.add_argument("--refresh-existing", action="store_true", help="Rewrite case_params.json, command.txt, and run_case.bat in existing case folders without deleting outputs.")
     return parser.parse_args()
 
 
@@ -273,6 +316,22 @@ def main() -> int:
         case_dir = case_root / case.folder_name
         if case_dir.exists() and args.overwrite:
             shutil.rmtree(case_dir)
+        elif case_dir.exists() and args.refresh_existing:
+            write_case_files(case_dir, case, exe_path)
+            case_folders.append(case.folder_name)
+            manifest_rows.append({
+                "Run": case.run_id,
+                "CaseFolder": str(case_dir),
+                "DiameterScale": case.flags["diameter_scale_factor"],
+                "PackingFactor": case.flags["phi_target"],
+                "f_La": case.flags["f_la"],
+                "f_Sr": case.flags["f_sr"],
+                "f_Fe": case.flags["f_fe"],
+                "f_Co": case.flags["f_co"],
+                "Status": "refreshed_existing",
+                "ReturnCode": "",
+            })
+            continue
         elif case_dir.exists() and not args.overwrite:
             print(f"Skipping existing case folder: {case_dir}")
             manifest_rows.append({
@@ -290,8 +349,11 @@ def main() -> int:
         return_code = ""
 
         if args.execute:
-            cmd = build_command(exe_path, case.flags)
+            run_flags = dict(case.flags)
+            run_flags["threads"] = resolve_threads_value(run_flags.get("threads", "0"))
+            cmd = build_command(exe_path, run_flags)
             print(f"Running case {case.run_id} in {case_dir}...")
+            print(f"  Using {run_flags['threads']} threads")
             result = subprocess.run(cmd, cwd=case_dir, check=False)
             return_code = str(result.returncode)
             status = "completed" if result.returncode == 0 else "failed"
