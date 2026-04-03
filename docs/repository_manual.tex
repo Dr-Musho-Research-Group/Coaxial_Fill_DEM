@@ -1,0 +1,604 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{hyperref}
+\usepackage{longtable}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{amsmath}
+\usepackage{fancyvrb}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!50!black,
+  urlcolor=blue!50!black
+}
+
+\setlist[itemize]{noitemsep, topsep=4pt}
+\setlist[enumerate]{noitemsep, topsep=4pt}
+\setlength{\parskip}{0.6em}
+\setlength{\parindent}{0pt}
+
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+
+\title{DEM Coaxial Fill Repository Manual}
+\author{Repository guide for new graduate students}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+\section{Purpose of This Repository}
+
+This repository contains a CPU-based discrete element method (DEM)-style simulator for packing particles into a coaxial, annular column. The main use case is to study how particles with different size distributions and compositions fill and settle inside a cylindrical annulus under gravity, shaking, optional repulsion, and optional top-ram compression.
+
+The repository is more than just the solver. It also includes:
+\begin{itemize}
+  \item Windows build scripts.
+  \item Single-run execution scripts for interactive testing.
+  \item Python scripts for post-processing and visualization.
+  \item A Taguchi-style parameter sweep workflow for running many cases.
+  \item Verification scripts for checking completed cases against requested targets.
+  \item Example generated outputs inside \texttt{testing\_map/cases/}.
+\end{itemize}
+
+If you are new to the project, the mental model is:
+\begin{enumerate}
+  \item Build or use the existing executable.
+  \item Run one simulation with \texttt{testing/\_run\_win\_cpu.bat}.
+  \item Inspect \texttt{.xyz} and \texttt{.vtk} outputs.
+  \item Post-process with the Python scripts.
+  \item Scale up to parameter studies with \texttt{testing\_map/run\_taguchi\_matrix.py}.
+  \item Verify finished studies with \texttt{testing\_map/run\_verify\_taguchi\_cases.bat}.
+\end{enumerate}
+
+\section{Repository Map}
+
+\begin{longtable}{p{0.24\textwidth}p{0.70\textwidth}}
+\toprule
+\textbf{Path} & \textbf{What it is for} \\
+\midrule
+\endhead
+\texttt{README.md} & Short project overview with a basic feature list and workflow summary. \\
+\texttt{src/coax\_pack\_cpu.cpp} & Main solver source. This is the most important file in the repository. \\
+\texttt{src/\_compile\_win.bat} & Windows batch file for compiling the solver with MSVC. \\
+\texttt{src/old/} & Older solver versions kept for history and comparison. Usually not the first place to edit. \\
+\texttt{testing/\_run\_win\_cpu.bat} & Main single-run driver script for Windows. Best entry point for day-to-day use. \\
+\texttt{testing/\_fill\_stats.py} & Computes radial and axial summary statistics from one \texttt{atoms\_<iter>.xyz} file. \\
+\texttt{testing/\_atoms\_plot\_all.py} & Generates visualizations and animations from \texttt{atoms\_*.xyz} frames. \\
+\texttt{testing/\_clean.bat} & Removes common output files from the \texttt{testing/} directory. \\
+\texttt{testing\_map/run\_taguchi\_matrix.py} & Creates many case folders from a CSV design matrix and can optionally execute them. \\
+\texttt{testing\_map/verify\_taguchi\_cases.py} & Checks completed Taguchi case folders against requested packing fraction, composition, and diameter-scale targets. \\
+\texttt{testing\_map/run\_verify\_taguchi\_cases.bat} & Windows wrapper for the verification script. \\
+\texttt{testing\_map/taguchi\_map.csv} & Input CSV for multi-case sweeps. \\
+\texttt{testing\_map/cases/} & Generated study folders with per-case commands, outputs, and manifests. \\
+\texttt{testing\_map/verification\_report.csv} & Generated verifier report with per-case pass/fail status and observed metrics. \\
+\texttt{testing\_map/success\_xyz/} & Generated folder containing the final XYZ file from each passing case. \\
+\texttt{testing\_map/\_fill\_stats.py} & Same role as the script in \texttt{testing/}, but used inside the sweep workflow. \\
+\texttt{testing\_map/\_atoms\_plot\_all.py} & Same role as the script in \texttt{testing/}, but used inside the sweep workflow. \\
+\bottomrule
+\end{longtable}
+
+\section{What the Solver Actually Simulates}
+
+\subsection{Geometry}
+
+The physical domain is an annulus:
+\begin{itemize}
+  \item Inner cylinder radius: \texttt{Rin}
+  \item Outer cylinder radius: \texttt{Rout}
+  \item Height: \texttt{L}
+\end{itemize}
+
+Particles are injected near the top and then evolve in full 3D Cartesian coordinates \((x,y,z)\).
+
+The domain volume used for the packing fraction estimate is:
+\[
+V_{\text{domain}} = \pi (R_{\text{out}}^2 - R_{\text{in}}^2)L
+\]
+
+\subsection{Particles}
+
+Each particle stores:
+\begin{itemize}
+  \item position,
+  \item velocity,
+  \item acceleration,
+  \item radius,
+  \item mass,
+  \item a material type identifier,
+  \item sleep-state information for performance.
+\end{itemize}
+
+There are four material types in the current code, corresponding to La, Sr, Fe, and Co. Each type has its own particle size distribution, and optional per-type density values can be used when computing mass.
+
+\subsection{Core Physics Model}
+
+The solver combines several mechanisms:
+\begin{itemize}
+  \item Hard-sphere style particle-particle contact with restitution.
+  \item Tangential damping during contact.
+  \item Inner-wall, outer-wall, bottom-wall, and optional top-piston constraints.
+  \item Optional wall spring-damper penalty response.
+  \item Optional shaking of the container.
+  \item Optional short-range repulsive forcing to encourage spreading.
+  \item Global linear damping.
+  \item Sleep and wake logic to reduce work once particles settle.
+\end{itemize}
+
+This is not a full continuum or bonded-particle model. It is a particle packing and settling simulator designed to be fast enough for parametric studies.
+
+\section{How the Main Time Loop Works}
+
+At a high level, \texttt{src/coax\_pack\_cpu.cpp} does the following each time step:
+\begin{enumerate}
+  \item Inject new particles while the fill stage is active.
+  \item Rebuild the linked-cell neighbor grid.
+  \item Wake particles if the ram is active or local conditions require it.
+  \item Resolve particle-particle contacts.
+  \item Compute body accelerations from gravity and shaking.
+  \item Apply optional short-range repulsive accelerations.
+  \item Integrate particle motion.
+  \item Apply wall and piston constraints.
+  \item Update sleep state.
+  \item Write output files at requested intervals.
+  \item Check whether the target packing fraction or early-stop criteria have been reached.
+\end{enumerate}
+
+This order matters. In the current code, the fill loop now includes an adaptive composition controller by default, so type selection can react to the instantaneous per-species injected volume while the bed is being filled.
+
+\section{Composition and Packing Fraction}
+
+\subsection{Species Fractions}
+
+The species fractions are stored as:
+\begin{center}
+\texttt{g\_type\_frac[4] = \{La, Sr, Fe, Co\}}
+\end{center}
+
+These fractions are normalized once at startup. In the current solver, they are used as requested composition targets for the adaptive composition controller unless that controller is explicitly disabled.
+
+\subsection{Important Interpretation}
+
+The code now has two composition modes:
+\begin{itemize}
+  \item \texttt{--adaptive\_composition 1} (default): the solver tracks injected occupied volume by species and biases future injections toward the species that is currently below its requested target.
+  \item \texttt{--adaptive\_composition 0}: the solver falls back to the legacy fixed-probability inlet sampler.
+\end{itemize}
+
+That means:
+\begin{itemize}
+  \item With adaptive control enabled, the code \textbf{does} track per-species injected occupied volume and update type selection during filling.
+  \item When \texttt{phi\_target} is active, the controller steers toward the final requested occupied-volume targets implied by \texttt{phi\_target} and \texttt{g\_type\_frac[]}.
+  \item When \texttt{phi\_target} is disabled, the controller still tries to keep the running injected mixture close to the requested fractions.
+  \item The code \textbf{does} compute a total packing fraction estimate from the total injected particle volume divided by the annular domain volume.
+\end{itemize}
+
+Even with adaptive control, the final composition is still not guaranteed to be exact. The process remains stochastic, particle sizes differ by species, and the run ends with finite particle counts. In practice, the adaptive controller should be viewed as a steering mechanism, and the verification scripts should be used to confirm whether a case met its requested tolerances.
+
+\subsection{Packing Fraction Target}
+
+The main packing fraction parameter is \texttt{phi\_target}. When the estimated total packing fraction reaches this target:
+\begin{itemize}
+  \item injection is disabled,
+  \item gravity is switched to zero,
+  \item the ram motion is frozen,
+  \item particles are woken once to allow relaxation.
+\end{itemize}
+
+After that, the run can continue until \texttt{niter} or stop earlier if the optional settling criteria are enabled.
+
+\section{Important Solver Parameters}
+
+This section explains the parameters a student will most often change. The flag-based interface is the recommended one.
+
+\subsection{Always Important}
+
+\begin{longtable}{p{0.22\textwidth}p{0.18\textwidth}p{0.52\textwidth}}
+\toprule
+\textbf{Flag} & \textbf{Typical type} & \textbf{Meaning} \\
+\midrule
+\endhead
+\texttt{--natoms\_max} & integer & Maximum number of particles that may be injected. \\
+\texttt{--dt} & real & Time step in seconds. Smaller is more stable but slower. \\
+\texttt{--niter} & integer & Total number of time steps. \\
+\texttt{--dump\_interval} & integer & Base output cadence. \\
+\texttt{--debug} & 0 or 1 & Enables extra console messages. \\
+\texttt{--seed} & integer & Random number seed. \\
+\texttt{--threads} & integer & OpenMP thread count. Zero means automatic. \\
+\texttt{--rin} & real & Inner radius of annulus in meters. \\
+\texttt{--rout} & real & Outer radius of annulus in meters. \\
+\texttt{--length} & real & Column length in meters. \\
+\texttt{--flux} & integer & Injection rate in particles per second. \\
+\texttt{--gravity} & real & Downward gravity magnitude. \\
+\texttt{--fill\_time} & real & Duration of the injection stage. \\
+\texttt{--phi\_target} & real & Stop-filling threshold based on estimated packed volume fraction. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Composition and Size}
+
+\begin{longtable}{p{0.22\textwidth}p{0.18\textwidth}p{0.52\textwidth}}
+\toprule
+\textbf{Flag} & \textbf{Typical type} & \textbf{Meaning} \\
+\midrule
+\endhead
+\texttt{--f\_la} & real & Requested La occupied-volume fraction target. \\
+\texttt{--f\_sr} & real & Requested Sr occupied-volume fraction target. \\
+\texttt{--f\_fe} & real & Requested Fe occupied-volume fraction target. \\
+\texttt{--f\_co} & real & Requested Co occupied-volume fraction target. \\
+\texttt{--diameter\_scale\_factor} & real & Multiplies all sampled diameters. Useful for sensitivity studies. \\
+\texttt{--adaptive\_composition} & 0 or 1 & Enables the feedback controller that updates type selection from instantaneous per-species injected volume. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Shaking and Motion}
+
+\begin{longtable}{p{0.22\textwidth}p{0.18\textwidth}p{0.52\textwidth}}
+\toprule
+\textbf{Flag} & \textbf{Typical type} & \textbf{Meaning} \\
+\midrule
+\endhead
+\texttt{--shake\_hz} & real & Shaking frequency. \\
+\texttt{--shake\_amp} & real & Legacy vertical shake amplitude. \\
+\texttt{--shake\_amp\_x} & real & Independent x-axis shake amplitude. \\
+\texttt{--shake\_amp\_y} & real & Independent y-axis shake amplitude. \\
+\texttt{--shake\_amp\_z} & real & Independent z-axis shake amplitude. \\
+\texttt{--shake\_xy\_legacy} & 0 or 1 & If 1, historical vertical shaking also affects x and y. \\
+\texttt{--inject\_vx} & real & Initial x velocity of injected particles. \\
+\texttt{--inject\_vy} & real & Initial y velocity of injected particles. \\
+\texttt{--inject\_vz} & real & Initial z velocity of injected particles. Usually negative. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Contacts, Damping, and Stabilization}
+
+\begin{longtable}{p{0.22\textwidth}p{0.18\textwidth}p{0.52\textwidth}}
+\toprule
+\textbf{Flag} & \textbf{Typical type} & \textbf{Meaning} \\
+\midrule
+\endhead
+\texttt{--cushion} & real & Expands effective collision radius without changing physical radius in output. \\
+\texttt{--lin\_damp} & real & Global linear velocity damping coefficient. \\
+\texttt{--e\_pp} & real & Restitution coefficient for particle-particle contact. \\
+\texttt{--e\_pw} & real & Restitution coefficient for particle-wall contact. \\
+\texttt{--tangent\_damp} & real & Tangential damping factor during contact. \\
+\texttt{--wall\_k} & real & Wall spring stiffness. Zero disables it. \\
+\texttt{--wall\_zeta} & real & Wall damping ratio. \\
+\texttt{--wall\_dvmax} & real & Velocity increment cap from wall spring response. \\
+\texttt{--wall\_rough\_amp} & real & Wall roughness amplitude. \\
+\texttt{--wall\_rough\_mth} & integer & Angular roughness mode count. \\
+\texttt{--wall\_rough\_mz} & integer & Axial roughness mode count. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Repulsion and Settling Controls}
+
+\begin{longtable}{p{0.22\textwidth}p{0.18\textwidth}p{0.52\textwidth}}
+\toprule
+\textbf{Flag} & \textbf{Typical type} & \textbf{Meaning} \\
+\midrule
+\endhead
+\texttt{--repulse\_range} & real & Gap range over which repulsion acts. Zero disables repulsion. \\
+\texttt{--repulse\_k\_pp} & real & Particle-particle repulsion strength. \\
+\texttt{--repulse\_k\_pw} & real & Particle-wall repulsion strength. \\
+\texttt{--repulse\_use\_mass} & 0 or 1 & Switches interpretation of repulsion coefficient. \\
+\texttt{--repulse\_dvmax} & real & Velocity increment cap from repulsion. \\
+\texttt{--ram\_start} & real & Time when top-ram motion begins. \\
+\texttt{--ram\_duration} & real & Duration of the ram stage. \\
+\texttt{--ram\_speed} & real & Downward ram speed. \\
+\texttt{--stop\_vrms} & real & Optional RMS-velocity settling threshold after \texttt{phi\_target}. \\
+\texttt{--stop\_vmax} & real & Optional max-velocity settling threshold after \texttt{phi\_target}. \\
+\texttt{--stop\_sleep\_frac} & real & Optional required fraction of sleeping particles. \\
+\texttt{--stop\_check\_interval} & integer & How often to evaluate stop conditions. \\
+\texttt{--stop\_checks\_required} & integer & Number of consecutive successful stop checks required. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Output Controls}
+
+\begin{longtable}{p{0.22\textwidth}p{0.18\textwidth}p{0.52\textwidth}}
+\toprule
+\textbf{Flag} & \textbf{Typical type} & \textbf{Meaning} \\
+\midrule
+\endhead
+\texttt{--xyz\_interval} & integer & XYZ output interval. If negative, follows \texttt{dump\_interval}. \\
+\texttt{--vtk\_interval} & integer & Particle VTK output interval. If negative, follows \texttt{dump\_interval}. \\
+\texttt{--vtk\_domain\_interval} & integer & Output interval for domain surface VTK files. Zero disables them. \\
+\texttt{--vtk\_domain\_segments} & integer & Number of segments used to tessellate the annular geometry in VTK. \\
+\bottomrule
+\end{longtable}
+
+\section{How to Build the Solver}
+
+\subsection{Windows}
+
+The repository already includes \texttt{src/\_compile\_win.bat}. It expects a local Visual Studio Build Tools installation and calls \texttt{vcvarsall.bat} before compiling.
+
+The command used there is approximately:
+\begin{Verbatim}[fontsize=\small]
+cl /EHsc /O2 /openmp:llvm /std:c++17 /Fe:coax_pack_cpu.exe coax_pack_cpu.cpp
+\end{Verbatim}
+
+If the executable already exists in \texttt{src/}, you may not need to rebuild immediately. Still, if you edit \texttt{src/coax\_pack\_cpu.cpp}, rebuild before running new cases.
+
+\subsection{Linux or macOS}
+
+The \texttt{README.md} suggests a GCC-style build such as:
+\begin{Verbatim}[fontsize=\small]
+g++ -O3 -march=native -fopenmp -std=c++17 -o coax_pack_cpu coax_pack_cpu.cpp
+\end{Verbatim}
+
+This repository is clearly organized around Windows batch workflows, so graduate students on Linux should expect to adapt the run scripts manually.
+
+\section{How to Run One Simulation}
+
+The easiest entry point is:
+\begin{center}
+\texttt{testing/\_run\_win\_cpu.bat}
+\end{center}
+
+That script:
+\begin{itemize}
+  \item defines a simulation parameter set,
+  \item cleans previous outputs in \texttt{testing/},
+  \item runs \texttt{..\textbackslash src\textbackslash coax\_pack\_cpu.exe},
+  \item optionally runs statistics and plotting scripts afterward.
+\end{itemize}
+
+\subsection{Recommended First Run}
+
+Before doing a large study, try this sequence:
+\begin{enumerate}
+  \item Open \texttt{testing/\_run\_win\_cpu.bat}.
+  \item Reduce \texttt{NATOMS\_MAX} and \texttt{NITER} if you want a quick smoke test.
+  \item Keep \texttt{VF}, geometry, and output intervals simple.
+  \item Run the batch file from Windows.
+  \item Verify that \texttt{atoms\_*.xyz} and \texttt{atom.*.vtk} files appear in \texttt{testing/}.
+\end{enumerate}
+
+\subsection{Why This Matters}
+
+This first run checks three things at once:
+\begin{itemize}
+  \item the executable works,
+  \item the output paths are correct,
+  \item your Python post-processing environment is at least partially usable.
+\end{itemize}
+
+\section{Understanding the Output Files}
+
+\subsection{XYZ Files}
+
+The solver writes files such as:
+\begin{center}
+\texttt{atoms\_1000.xyz}
+\end{center}
+
+These contain one particle per line and include:
+\begin{itemize}
+  \item element symbol,
+  \item \(x\), \(y\), and \(z\) position,
+  \item particle diameter, written as \(2r\).
+\end{itemize}
+
+These files are especially useful for:
+\begin{itemize}
+  \item lightweight analysis in Python,
+  \item custom statistics,
+  \item simple debugging of geometry and fill behavior.
+\end{itemize}
+
+\subsection{VTK Files}
+
+The solver also writes particle VTK files such as:
+\begin{center}
+\texttt{atom.1000.vtk}
+\end{center}
+
+These are intended for ParaView. The VTK files include particle positions and scalar fields such as radius and type ID, plus a string field for element symbol.
+
+\subsection{Optional Domain VTK}
+
+If \texttt{--vtk\_domain\_interval} is enabled, the code can also write a geometry surface VTK file for the annular domain and top boundary. This helps visually compare particles to the confining geometry.
+
+\section{Post-Processing Scripts}
+
+\subsection{\texttt{testing/\_fill\_stats.py}}
+
+This script reads one XYZ snapshot and computes:
+\begin{itemize}
+  \item radial mean particle radius,
+  \item radial coefficient of variation,
+  \item a radial segregation index,
+  \item axial mean particle radius,
+  \item axial coefficient of variation,
+  \item a 2D heatmap in \((r,z)\),
+  \item a CSV summary table.
+\end{itemize}
+
+The solver writes particle diameter in the fourth numeric XYZ column. The statistics scripts use that value directly as \texttt{a}, so if you need a physically exact radius-based interpretation, review the script and convert \(a \rightarrow a/2\) where appropriate before using the results quantitatively.
+
+\subsection{Interpretation Caution}
+
+This script is mainly radius-based. It does not directly compute exact species-wise volume fractions or full bed porosity. If you need those, you would write an additional analysis script.
+
+\subsection{\texttt{testing/\_atoms\_plot\_all.py}}
+
+This script builds visualizations and animations from a sequence of XYZ frames. It is useful for quickly checking:
+\begin{itemize}
+  \item whether injection is happening where you expect,
+  \item whether particles are piling up or segregating,
+  \item whether shaking or repulsion changes the bed structure over time.
+\end{itemize}
+
+\subsection{\texttt{testing\_map/verify\_taguchi\_cases.py}}
+
+This script checks finished Taguchi cases against the requested study design. For each case folder, it:
+\begin{itemize}
+  \item verifies the generated case metadata matches the row in \texttt{taguchi\_map.csv},
+  \item finds the final \texttt{atoms\_*.xyz} snapshot,
+  \item computes the observed total packing fraction,
+  \item computes observed species occupied-volume fractions,
+  \item infers the realized diameter scale factor,
+  \item writes a pass/fail report.
+\end{itemize}
+
+The Windows wrapper \texttt{testing\_map/run\_verify\_taguchi\_cases.bat} is the easiest way to launch it after a sweep is complete.
+
+\section{Taguchi and Multi-Case Workflow}
+
+\subsection{Why This Exists}
+
+Once a single simulation works, researchers usually want parameter sweeps. The repository supports that with:
+\begin{center}
+\texttt{testing\_map/run\_taguchi\_matrix.py}
+\end{center}
+
+This script reads a CSV and creates one folder per case.
+
+\subsection{Expected CSV Columns}
+
+The current script expects at least:
+\begin{Verbatim}[fontsize=\small]
+Run, diameter_scale_factor, PF_value, f_La, f_Sr, f_Fe, f_Co
+\end{Verbatim}
+
+\subsection{What the Script Produces}
+
+For each case, the script writes:
+\begin{itemize}
+  \item \texttt{case\_params.json},
+  \item \texttt{command.txt},
+  \item \texttt{run\_case.bat}.
+\end{itemize}
+
+It also writes:
+\begin{itemize}
+  \item a study-level \texttt{manifest.csv},
+  \item a study-level \texttt{run\_all\_cases.bat}.
+\end{itemize}
+
+\subsection{How to Think About a Case Folder}
+
+Each case folder is meant to be self-contained enough that you can:
+\begin{itemize}
+  \item see exactly which flags were used,
+  \item rerun the case,
+  \item inspect outputs without mixing them with other runs.
+\end{itemize}
+
+\subsection{Suggested Workflow for Sweeps}
+
+\begin{enumerate}
+  \item Edit \texttt{testing\_map/taguchi\_map.csv}.
+  \item Run the case generator.
+  \item Review one or two generated \texttt{command.txt} files before launching everything.
+  \item Run cases sequentially with \texttt{run\_all\_cases.bat} or let the Python driver execute them.
+  \item Run \texttt{run\_verify\_taguchi\_cases.bat} after the sweep completes.
+  \item Use \texttt{manifest.csv} and \texttt{verification\_report.csv} together as the study ledger.
+\end{enumerate}
+
+\section{Old Versions and Historical Files}
+
+The \texttt{src/old/} and \texttt{testing/old/} folders contain older development snapshots. These are useful when:
+\begin{itemize}
+  \item you want to compare behavior across solver revisions,
+  \item you are searching for when a feature was introduced,
+  \item you need to recover an older implementation idea.
+\end{itemize}
+
+They are usually \textbf{not} the right place for routine edits unless you are doing deliberate archaeology.
+
+\section{Practical Advice for New Graduate Students}
+
+\subsection{Start Small}
+
+When you inherit a DEM codebase, the biggest risk is changing too many things before you know what a healthy run looks like. Start with:
+\begin{itemize}
+  \item fewer particles,
+  \item shorter runs,
+  \item frequent output,
+  \item one changed parameter at a time.
+\end{itemize}
+
+\subsection{Record Assumptions}
+
+For every study, keep a notebook or spreadsheet that records:
+\begin{itemize}
+  \item the git commit or repository snapshot,
+  \item which batch or Python script launched the run,
+  \item the exact parameter changes from baseline,
+  \item what outcome you expected before the run.
+\end{itemize}
+
+\subsection{Common Beginner Mistakes}
+
+\begin{itemize}
+  \item Assuming adaptive control guarantees exact final packed fractions without post-run verification.
+  \item Running too few time steps after injection ends and then calling the structure settled.
+  \item Forgetting that output intervals may be different for XYZ and VTK.
+  \item Mixing results from different cases in the same folder.
+  \item Changing multiple physics knobs at once and losing interpretability.
+\end{itemize}
+
+\section{Suggested First-Week Learning Plan}
+
+\begin{enumerate}
+  \item Read \texttt{README.md} and this manual once without editing anything.
+  \item Open \texttt{src/coax\_pack\_cpu.cpp} and skim the global parameters and the main loop.
+  \item Run one tiny case with \texttt{testing/\_run\_win\_cpu.bat}.
+  \item Open one \texttt{atom.*.vtk} file in ParaView.
+  \item Run \texttt{\_fill\_stats.py} on one final XYZ frame.
+  \item Generate two or three Taguchi cases and inspect the generated \texttt{command.txt} files.
+  \item Run the verification script on those pilot cases.
+  \item Only after that, begin changing physics or composition settings.
+\end{enumerate}
+
+\section{Where to Edit for Common Tasks}
+
+\begin{longtable}{p{0.30\textwidth}p{0.58\textwidth}}
+\toprule
+\textbf{Goal} & \textbf{Where to start} \\
+\midrule
+\endhead
+Change default solver behavior & \texttt{src/coax\_pack\_cpu.cpp} \\
+Compile on Windows & \texttt{src/\_compile\_win.bat} \\
+Run a single case & \texttt{testing/\_run\_win\_cpu.bat} \\
+Add a simple new post-processing metric & \texttt{testing/\_fill\_stats.py} \\
+Automate a parameter sweep & \texttt{testing\_map/run\_taguchi\_matrix.py} \\
+Verify a completed sweep & \texttt{testing\_map/verify\_taguchi\_cases.py} \\
+Adjust study design values & \texttt{testing\_map/taguchi\_map.csv} \\
+Compare against an older solver revision & \texttt{src/old/} \\
+\bottomrule
+\end{longtable}
+
+\section{Known Limits of the Current Repository}
+
+Based on the current source tree, new users should be aware of these limits:
+\begin{itemize}
+  \item The project is strongly Windows-oriented in its automation.
+  \item Adaptive composition control improves agreement with requested targets, but it still does not guarantee an exact final composition.
+  \item Post-processing is helpful but still fairly lightweight; some research questions will need custom scripts.
+  \item Many generated outputs are large, so storage discipline matters.
+  \item Old generated case folders inside \texttt{testing\_map/cases/} can make the repository look much larger than the hand-written source actually is.
+\end{itemize}
+
+\section{Final Takeaway}
+
+The heart of this repository is simple:
+\begin{itemize}
+  \item \texttt{src/coax\_pack\_cpu.cpp} is the simulator.
+  \item \texttt{testing/} is for running and inspecting one case.
+  \item \texttt{testing\_map/} is for systematic multi-case studies.
+\end{itemize}
+
+If you understand those three layers, you can already do productive research with this codebase.
+
+\end{document}

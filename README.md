@@ -1,200 +1,197 @@
 # Coaxial Fill DEM (CPU)
 
-3D hard-sphere DEM-style packing in a coaxial (annular) column with gravity-driven filling, optional multi-axis shaking, cushion radius support, enhanced wall spring contacts, and an optional top ram stage.
+3D hard-sphere DEM-style packing in a coaxial annulus with gravity-driven filling, multi-type particle size distributions, optional shaking, optional wall spring contacts, optional repulsion, and an optional top ram stage.
 
-The solver uses a cell-linked neighbor search, impulse-based sphere-sphere collisions, optional spring-damper wall contacts, and damping for realistic settling behavior.
+The solver is centered around [`src/coax_pack_cpu.cpp`](src/coax_pack_cpu.cpp). Around that core, the repository includes batch runners, parameter-sweep tooling, post-processing scripts, and verification utilities for Taguchi studies.
 
-This version extends the original code with:
-- Taguchi test matrix automation
-- Composition control (La, Sr, Fe, Co)
-- Diameter scaling
-- Structured batch execution
-- ParaView visualization workflow
+## Recent Improvements
 
----
+- Adaptive composition control now uses instantaneous per-species injected volume to steer deposition toward the requested final occupied-volume fractions.
+- A new solver flag, `--adaptive_composition 0|1`, lets you switch between the new feedback-controlled mode and the legacy fixed inlet sampling behavior.
+- `testing_map/verify_taguchi_cases.py` verifies each completed Taguchi case against the requested packing factor, species volume fractions, and diameter scale factor.
+- `testing_map/run_verify_taguchi_cases.bat` provides a direct Windows entry point for the verifier.
+- Verification outputs now include `verification_report.csv`, `verification_summary.txt`, and a `success_xyz/` folder containing the last XYZ file from each passing case.
 
 ## Features
 
-- Annular domain: inner and outer cylindrical walls with finite height L
-- Gravity-driven particle injection
-- Multi-type particle size distributions
-- Composition-controlled material fractions
+- Annular domain with inner wall, outer wall, bottom plane, and optional top ram
+- Gravity-driven particle injection from the top of the column
+- Four material types with independent size distributions and optional per-type density
+- Adaptive composition controller for matching target occupied-volume fractions
 - Diameter scaling for parametric studies
 - Normal restitution and tangential damping
-- Cushion radius support
-- Wall spring-damper model
-- Multi-axis shaking (x, y, z)
-- Optional top ram stage
-- Automated Taguchi case generation
-- VTK + XYZ outputs for visualization
+- Cushion-radius collision inflation
+- Optional wall spring-damper contact model
+- Optional multi-axis shaking
+- Optional short-range repulsion to improve spreading
+- Early-stop criteria after reaching `phi_target`
+- XYZ and VTK output for analysis and visualization
+- Taguchi case generation and verification workflow
 
----
+## Repository Layout
 
-## Build Instructions
+- `src/coax_pack_cpu.cpp`: main CPU solver
+- `src/_compile_win.bat`: Windows build helper
+- `testing/_run_win_cpu.bat`: single-run Windows workflow
+- `testing/_fill_stats.py`: simple radial and axial analysis from one XYZ snapshot
+- `testing/_atoms_plot_all.py`: frame visualization and animation helper
+- `testing_map/run_taguchi_matrix.py`: creates and optionally executes multi-case studies
+- `testing_map/taguchi_map.csv`: Taguchi input table
+- `testing_map/verify_taguchi_cases.py`: verifies finished case folders against Taguchi targets
+- `testing_map/run_verify_taguchi_cases.bat`: Windows wrapper for verification
+- `testing_map/cases/`: generated case folders and outputs
+
+## Build
 
 ### Linux / macOS
 
-```
+```bash
 g++ -O3 -march=native -fopenmp -std=c++17 -o coax_pack_cpu coax_pack_cpu.cpp
 ```
 
 ### Windows (MSVC)
 
-```
-cl /O2 /openmp /std:c++17 coax_pack_cpu.cpp /Fe:coax_pack_cpu.exe
-```
+From `src/`:
 
----
-
-## Core Solver Parameters (Original)
-
-These are the primary physical controls of the solver:
-
-1  natoms_max     Total particles  
-2  dt             Time step  
-3  niter          Number of steps  
-4  dump_interval  Output frequency  
-5  debug          Debug flag  
-6  seed           RNG seed  
-7  Rin            Inner radius  
-8  Rout           Outer radius  
-9  L              Column height  
-10 flux           Injection rate  
-11 g              Gravity  
-12 shake_hz       Shake frequency  
-13 shake_amp      Legacy shake amplitude  
-14 fill_time      Injection duration  
-15 ram_start      Ram start time  
-16 ram_duration   Ram duration  
-17 ram_speed      Ram speed  
-18 VF             Target volume fraction  
-
----
-
-## New Parameters
-
-### Diameter Scaling
-
-```
---diameter_scale_factor <value>
+```bat
+_compile_win.bat
 ```
 
-Scales all particle diameters.
+Or directly:
 
----
-
-### Composition Fractions
-
-```
---f_la <value>
---f_sr <value>
---f_fe <value>
---f_co <value>
+```bat
+cl /EHsc /O2 /openmp:llvm /std:c++17 /Fe:coax_pack_cpu.exe coax_pack_cpu.cpp
 ```
 
-Order:
-```
+## Core Solver Controls
+
+These are the most important physical and workflow flags:
+
+- `--natoms_max`: maximum number of injected particles
+- `--dt`: time step in seconds
+- `--niter`: number of time steps
+- `--dump_interval`: base output interval
+- `--rin`, `--rout`, `--length`: annulus geometry
+- `--flux`: particle injection rate
+- `--gravity`: gravity magnitude
+- `--fill_time`: injection duration
+- `--phi_target`: stop-filling target based on occupied volume fraction
+- `--f_la`, `--f_sr`, `--f_fe`, `--f_co`: requested species targets
+- `--diameter_scale_factor`: multiplier applied to sampled diameters
+- `--adaptive_composition 0|1`: enable or disable feedback-controlled composition steering
+
+## Composition Control
+
+The requested composition fractions are stored in the order:
+
+```text
 {La, Sr, Fe, Co}
 ```
 
-Fractions are normalized internally.
+Current default behavior is:
 
----
+- `--adaptive_composition 1` by default
+- the solver tracks injected occupied volume by species
+- when `phi_target` is active, injection is biased toward the species that is currently below its requested occupied-volume target
+- if adaptive control is disabled, the code falls back to legacy fixed-probability inlet sampling
 
-### Packing Factor
+Important nuance:
 
+- The adaptive controller steers the mixture toward the requested final metrics
+- It does not mathematically guarantee an exact match because the process is still stochastic and particle sizes vary by species
+- Verification after the run is still recommended
+
+## Recommended Workflows
+
+### Single Run
+
+Use:
+
+```bat
+testing\_run_win_cpu.bat
 ```
---phi_target <value>
-```
 
----
+This is the best entry point for interactive solver tuning and quick experiments.
 
-## Taguchi Workflow (Recommended)
+### Taguchi Study
 
-### 1. Create CSV
+1. Edit `testing_map/taguchi_map.csv`
+2. Generate case folders with:
 
-```
-Run,diameter_scale_factor,PF_value,f_La,f_Sr,f_Fe,f_Co
-1,1.0,0.55,0.45,0.20,0.30,0.05
-```
-
----
-
-### 2. Generate Cases
-
-```
+```bat
+cd testing_map
 _run_taguchi_matrix.bat
 ```
 
----
+3. Run the cases:
 
-### 3. Run All Cases
-
-```
+```bat
 cases\run_all_cases.bat
 ```
 
----
+4. Verify the outputs:
+
+```bat
+run_verify_taguchi_cases.bat
+```
+
+## Verification Workflow
+
+The verifier reads each Taguchi row, inspects the corresponding `cases/run_###` folder, finds the last `atoms_*.xyz`, and checks:
+
+- configured case parameters vs. `taguchi_map.csv`
+- final occupied packing fraction vs. `PF_value`
+- final species occupied-volume fractions vs. `f_La`, `f_Sr`, `f_Fe`, `f_Co`
+- inferred diameter scale factor vs. `diameter_scale_factor`
+
+Outputs:
+
+- `testing_map/verification_report.csv`: per-case pass/fail table with observed metrics
+- `testing_map/verification_summary.txt`: quick summary of the run
+- `testing_map/success_xyz/`: copies of the last XYZ file for each passing case
+
+## Output Files
+
+- `atoms_<iter>.xyz`: element symbol, `x`, `y`, `z`, and particle diameter (`2*r`)
+- `atom.<iter>.vtk`: VTK particle output with radius, type ID, and element label
+- stdout: iteration, time, and packing-fraction progress
+
+For ParaView:
+
+- open `atom.<iter>.vtk`
+- apply `Glyph (Sphere)`
+- scale by radius field `r`
+- color by type, velocity, or position
 
 ## Folder Structure
 
+```text
+testing_map/
+  taguchi_map.csv
+  run_taguchi_matrix.py
+  verify_taguchi_cases.py
+  run_verify_taguchi_cases.bat
+  verification_report.csv
+  verification_summary.txt
+  success_xyz/
+  cases/
+    manifest.csv
+    run_all_cases.bat
+    run_001/
+      case_params.json
+      command.txt
+      run_case.bat
+      atoms_*.xyz
+      atom.*.vtk
 ```
-cases/
-  manifest.csv
-  run_all_cases.bat
-  run_001/
-    case_params.json
-    command.txt
-    run_case.bat
-    atoms_*.xyz
-    atom.*.vtk
-```
-
----
-
-## Output Files (Original)
-
-- atoms_<iter>.xyz → particle positions and radius  
-- atom.<iter>.vtk → VTK visualization  
-- stdout → iteration, time, packing fraction  
-
----
-
-## ParaView Visualization
-
-Open:
-
-```
-atom.<iter>.vtk
-```
-
-### Recommended Workflow
-
-- Apply Glyph (Sphere)
-- Scale by radius `r`
-- Color by velocity or position
-- Use Slice or Clip filters
-- Animate timesteps
-
----
-
-## Student Workflow
-
-1. Edit CSV  
-2. Run generator  
-3. Run simulations  
-4. Visualize in ParaView  
-5. Analyze using manifest.csv  
-
----
 
 ## Tips
 
-- Start with small particle counts
-- Use debug mode
-- Verify packing with XYZ output
-
----
+- Start with small particle counts and short runs before launching large sweeps
+- Keep `debug` on while tuning new physics settings
+- Use `phi_target` together with adaptive composition control for composition-sensitive studies
+- Verify completed studies instead of assuming the requested metrics were achieved
+- Treat the final column of `atoms_*.xyz` as diameter, not radius
 
 ## License
 

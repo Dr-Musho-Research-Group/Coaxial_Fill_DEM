@@ -283,6 +283,7 @@ static std::array<SizeDist,4> g_types = {};
 //                             La       Sr      Fe      Co
 static real g_type_frac[4] = {0.4667, 0.2020, 0.2945, 0.0368};
 static real g_diameter_scale_factor = 1.0;
+static int  g_adaptive_composition = 1;
 
 // Optional: per-type density (defaults to global density)
 static real g_density_type[4] = {0,0,0,0}; // 0 => use g_density
@@ -530,8 +531,12 @@ void dump_vtk(const std::vector<Particle>& P, int iter){
 }
 
 
+static inline real sphere_volume_from_radius(real r){
+    return (4.0/3.0) * real(M_PI) * r*r*r;
+}
+
 // Pick a particle type by g_type_frac[] (fractions; normalized)
-inline int sample_type(std::mt19937& rng){
+inline int sample_type_fixed(std::mt19937& rng){
     std::uniform_real_distribution<real> U(0.0,1.0);
     real fsum = g_type_frac[0] + g_type_frac[1] + g_type_frac[2] + g_type_frac[3];
     if (fsum <= 0) return 0;
@@ -541,6 +546,45 @@ inline int sample_type(std::mt19937& rng){
     acc += g_type_frac[1];
     if (r < acc) return 1;
     acc += g_type_frac[2];
+    if (r < acc) return 2;
+    return 3;
+}
+
+inline int sample_type_adaptive(std::mt19937& rng,
+                                real domVol,
+                                real totalVol_now,
+                                const std::array<real,4>& typeVol_now){
+    if (!g_adaptive_composition) return sample_type_fixed(rng);
+
+    std::array<real,4> weights = {0,0,0,0};
+    real wsum = 0.0;
+
+    // If phi_target is active, steer toward the final requested per-species occupied volumes.
+    // Otherwise, steer toward the instantaneous mixture implied by the requested fractions.
+    const real targetTotalVol = (g_phi_target > 0.0 && domVol > 0.0)
+        ? (g_phi_target * domVol)
+        : totalVol_now;
+
+    if (targetTotalVol > 0.0) {
+        for (int itype = 0; itype < 4; ++itype) {
+            const real targetVol = g_type_frac[itype] * targetTotalVol;
+            const real deficit = targetVol - typeVol_now[itype];
+            if (deficit > 0.0) {
+                weights[itype] = deficit;
+                wsum += deficit;
+            }
+        }
+    }
+
+    if (wsum <= 0.0) return sample_type_fixed(rng);
+
+    std::uniform_real_distribution<real> U(0.0,1.0);
+    real r = U(rng) * wsum;
+    real acc = weights[0];
+    if (r < acc) return 0;
+    acc += weights[1];
+    if (r < acc) return 1;
+    acc += weights[2];
     if (r < acc) return 2;
     return 3;
 }
@@ -1350,6 +1394,7 @@ int main(int argc, char** argv){
             "     [--flux N] [--gravity G] [--shake_hz HZ] [--shake_amp A]\n"
             "     [--fill_time T] [--ram_start T0] [--ram_duration DT] [--ram_speed V]\n"
             "     [--phi_target PHI]\n"
+            "     [--adaptive_composition 0|1]\n"
             "     [--repulse_range R] [--repulse_k_pp K] [--repulse_k_pw K] [--repulse_use_mass 0|1] [--repulse_dvmax V]\n"
             "     [--stop_vrms V] [--stop_vmax V] [--stop_sleep_frac F]\n"
             "     [--stop_check_interval N] [--stop_checks_required N]\n"
@@ -1414,6 +1459,7 @@ int main(int argc, char** argv){
 
     g_phi_target = 0.0;
     g_diameter_scale_factor = 1.0;
+    g_adaptive_composition = 1;
 
     g_stop_vrms = 0.0;
     g_stop_vmax = 0.0;
@@ -1547,6 +1593,8 @@ int main(int argc, char** argv){
         get_r("diameter_scale", g_diameter_scale_factor);
         get_r("diam_scale", g_diameter_scale_factor);
         get_r("dsf", g_diameter_scale_factor);
+        get_i("adaptive_composition", g_adaptive_composition);
+        get_i("adaptive_comp", g_adaptive_composition);
 
         get_r("f_la", g_type_frac[0]);
         get_r("f_sr", g_type_frac[1]);
@@ -1658,6 +1706,7 @@ init_default_distributions_once();
     const real domVol = M_PI * (g_Rout*g_Rout - g_Rin*g_Rin) * g_L;
     // running particle-volume accumulator (O(1) update on injection)
     real totalVol_running = 0.0;
+    std::array<real,4> typeVol_running = {0,0,0,0};
 
     // piston kinematics
     auto topPlane = [&](real t)->real{
@@ -1678,6 +1727,7 @@ init_default_distributions_once();
                 g_Rin, g_Rout, g_L, g_fill_time, g_flux);
     std::printf("Diameter scale factor=%.6g | Fractions (La,Sr,Fe,Co)=(%.6g, %.6g, %.6g, %.6g)\n",
                 g_diameter_scale_factor, g_type_frac[0], g_type_frac[1], g_type_frac[2], g_type_frac[3]);
+    std::printf("Adaptive composition control=%d\n", g_adaptive_composition ? 1 : 0);
 
     for (int it=0; it<=g_niter; ++it, t += g_dt){
         // 1) Inject new spheres while t < fill_time
@@ -1711,6 +1761,30 @@ init_default_distributions_once();
             if (want > 0){
                 int oldN = (int)P.size();
                 P.resize(oldN + want);
+                std::vector<int> staged_type(want, 0);
+                std::vector<real> staged_r(want, 0.0);
+                std::vector<real> staged_m(want, 0.0);
+
+                // Plan the injected particle types serially so the composition controller
+                // can update after every sampled particle volume.
+                {
+                    std::array<real,4> planTypeVol = typeVol_running;
+                    real planTotalVol = totalVol_running;
+                    std::mt19937 plan_rng((unsigned)g_seed + 0x85EBCA6Bu + (unsigned)it*131u);
+                    for (int k=0; k<want; ++k){
+                        const int t_id = sample_type_adaptive(plan_rng, domVol, planTotalVol, planTypeVol);
+                        const real d = sample_diameter_for_type(plan_rng, t_id);
+                        const real r = 0.5*d;
+                        real rho = g_density;
+                        if (t_id>=0 && t_id<4 && g_density_type[t_id] > 0.0) rho = g_density_type[t_id];
+                        staged_type[k] = t_id;
+                        staged_r[k] = r;
+                        staged_m[k] = rho * sphere_volume_from_radius(r);
+                        const real vol = sphere_volume_from_radius(r);
+                        if (t_id>=0 && t_id<4) planTypeVol[t_id] += vol;
+                        planTotalVol += vol;
+                    }
+                }
                 // Per-thread RNGs to avoid races and XY bias
 #if defined(_OPENMP)
                 #pragma omp parallel
@@ -1720,12 +1794,10 @@ init_default_distributions_once();
                     #pragma omp for
                     for (int k=0;k<want;++k){
                         // resample until the diameter fits the annulus
-                        real d; real r; real x; real y;
-                        int  t_id;
+                        real r; real x; real y;
+                        const int t_id = staged_type[k];
                         for(;;){
-                            t_id = sample_type(trng);
-                            d = sample_diameter_for_type(trng, t_id);
-                            r = 0.5*d;
+                            r = staged_r[k];
                             sample_injection_xy(trng, r, x, y);
                             if (x==x && y==y) { // not NaN => valid
                                 break;
@@ -1737,14 +1809,7 @@ init_default_distributions_once();
                         a.v = {g_inject_vx, g_inject_vy, g_inject_vz}; // injection initial velocity
                         a.a = {0,0,0};
                         a.r = r;
-                        // mass from per-type density if specified, else global
-                        {
-                            real rho = g_density;
-                            if (t_id>=0 && t_id<4 && g_density_type[t_id] > 0.0) {
-                                rho = g_density_type[t_id];
-                            }
-                            a.m = rho * (4.0/3.0) * real(M_PI) * r*r*r;
-                        }
+                        a.m = staged_m[k];
                         a.type_id = (uint8_t)(t_id & 0xFF);
                         a.asleep = false;
                         a.calm_steps = 0;
@@ -1756,12 +1821,10 @@ init_default_distributions_once();
                 // Serial fallback when OpenMP is not enabled
                 std::mt19937 trng((unsigned)g_seed + (unsigned)it*101u);
                 for (int k=0;k<want;++k){
-                    real d; real r; real x; real y;
-                    int  t_id;
+                    real r; real x; real y;
+                    const int t_id = staged_type[k];
                     for(;;){
-                        t_id = sample_type(trng);
-                        d = sample_diameter_for_type(trng, t_id);
-                        r = 0.5*d;
+                        r = staged_r[k];
                         sample_injection_xy(trng, r, x, y);
                         if (x==x && y==y) break;
                     }
@@ -1771,11 +1834,7 @@ init_default_distributions_once();
                     a.v = {g_inject_vx, g_inject_vy, g_inject_vz};
                     a.a = {0,0,0};
                     a.r = r;
-                    {
-                        real rho = g_density;
-                        if (t_id>=0 && t_id<4 && g_density_type[t_id] > 0.0) rho = g_density_type[t_id];
-                        a.m = rho * (4.0/3.0) * real(M_PI) * r*r*r;
-                    }
+                    a.m = staged_m[k];
                     a.type_id = (uint8_t)(t_id & 0xFF);
                     a.asleep = false;
                     a.calm_steps = 0;
@@ -1787,7 +1846,10 @@ init_default_distributions_once();
                 // update running volume cheaply for new range
                 for (int k = oldN; k < oldN + want; ++k) {
                     const real r = P[k].r;
-                    totalVol_running += (4.0/3.0) * real(M_PI) * r*r*r;
+                    const real vol = sphere_volume_from_radius(r);
+                    totalVol_running += vol;
+                    const int t_id = (int)P[k].type_id;
+                    if (t_id >= 0 && t_id < 4) typeVol_running[t_id] += vol;
                 }
             }
         }
