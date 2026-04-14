@@ -25,15 +25,19 @@ if not exist "%CSV_PATH%" (
 )
 
 set "PY_CMD="
-where py >nul 2>nul
-if not errorlevel 1 set "PY_CMD=py"
+where python >nul 2>nul
+if not errorlevel 1 set "PY_CMD=python"
 if not defined PY_CMD (
-    where python >nul 2>nul
-    if not errorlevel 1 set "PY_CMD=python"
+    if exist "C:\Program Files\Inkscape\bin\python.exe" set "PY_CMD=C:\Program Files\Inkscape\bin\python.exe"
+)
+if not defined PY_CMD (
+    where py >nul 2>nul
+    if not errorlevel 1 set "PY_CMD=py"
 )
 
 if not defined PY_CMD (
-    echo ERROR: Could not find Python. Add py or python to PATH.
+    echo ERROR: Could not find a usable Python launcher.
+    echo Tried: python, C:\Program Files\Inkscape\bin\python.exe, and py
     exit /b 1
 )
 

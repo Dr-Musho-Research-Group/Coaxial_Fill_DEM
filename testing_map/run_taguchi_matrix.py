@@ -30,18 +30,28 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 
+# The case-1 tuning runs in ./testing showed this workflow is overhead-limited
+# well before it can use dozens of logical cores effectively, so the default
+# auto-thread cap here follows the tuned plateau region rather than the full CPU.
+RECOMMENDED_THREAD_CAP = 4
+
+
 BASE_FLAGS: Dict[str, str] = {
     "natoms_max": "25000",
-    "dt": "2e-6",
-    "niter": "200000",
-    "dump_interval": "1000",
+    # Tuned defaults based on the best finished case-1 probe from ./testing.
+    # The larger dt, slightly higher flux, and stronger post-fill damping cut
+    # wall time substantially while preserving final-only output behavior here.
+    "dt": "4e-6",
+    "niter": "120000",
+    "dump_interval": "10000",
     "debug": "1",
     "seed": "42",
     "threads": "0",
+    "omp_min_particles": "512",
     "rin": "23e-6",
     "rout": "39e-6",
     "length": "379e-6",
-    "flux": "20000",
+    "flux": "24000",
     "gravity": "0.0",
     "shake_hz": "1000",
     "shake_amp": "0",
@@ -57,6 +67,8 @@ BASE_FLAGS: Dict[str, str] = {
     "wall_rough_mth": "8",
     "wall_rough_mz": "3",
     "lin_damp": "800.0",
+    # Extra damping is only applied after injection completes.
+    "post_fill_lin_damp": "1500.0",
     "e_pp": "0.20",
     "e_pw": "0.15",
     "tangent_damp": "0.90",
@@ -65,22 +77,31 @@ BASE_FLAGS: Dict[str, str] = {
     "repulse_k_pw": "500",
     "repulse_use_mass": "0",
     "repulse_dvmax": "0.2",
-    "stop_vrms": "5e-6",
-    "stop_vmax": "2e-5",
-    "stop_sleep_frac": "0.95",
-    "stop_check_interval": "500",
+    # The sleep-fraction gate stays off here because these runs often settle
+    # before particles are marked asleep in large numbers.
+    "stop_vrms": "0.006",
+    "stop_vmax": "0.12",
+    "stop_sleep_frac": "0.0",
+    "stop_check_interval": "1000",
     "stop_checks_required": "10",
     "inject_vx": "0.0",
     "inject_vy": "0.0",
-    "inject_vz": "-0.05",
+    "inject_vz": "-0.04",
     "fill_time": "8.0",
     "ram_start": "0.0",
     "ram_duration": "0.0",
     "ram_speed": "0.0",
     "adaptive_composition": "1",
-    "vtk_interval": "1000",
+    # Progress mode keeps the requested species mix on track continuously and
+    # reduces late-stage make-up of one species near the inlet.
+    "adaptive_comp_mode": "1",
+    "comp_report_interval": "10000",
+    "xyz_interval": "0",
+    "vtk_interval": "0",
     "vtk_domain_interval": "0",
     "vtk_domain_segments": "96",
+    "dump_final_xyz": "1",
+    "dump_final_vtk": "1",
 }
 
 CASE_MAP = {
@@ -162,9 +183,12 @@ def replace_flag_value(cmd: List[str], flag_name: str, value: str) -> List[str]:
 
 def resolve_threads_value(raw_threads: str) -> str:
     value = clean_cell(raw_threads)
+    cpu_count = max(1, os.cpu_count() or 1)
     if not value or value == "0":
-        return str(max(1, os.cpu_count() or 1))
-    return value
+        # Auto mode uses the measured plateau region by default rather than
+        # blindly taking every logical core.
+        return str(min(cpu_count, RECOMMENDED_THREAD_CAP))
+    return str(min(cpu_count, int(float(value))))
 
 
 def find_latest_atoms(case_dir: Path) -> Optional[Path]:
@@ -233,7 +257,9 @@ def write_case_files(case_dir: Path, case: Case, exe_path: Path) -> None:
         "setlocal",
         f'cd /d "%~dp0"',
         f'set "THREADS_TO_USE={case.flags["threads"]}"',
-        'if "%THREADS_TO_USE%"=="0" set "THREADS_TO_USE=%NUMBER_OF_PROCESSORS%"',
+        f'set "RECOMMENDED_THREAD_CAP={RECOMMENDED_THREAD_CAP}"',
+        'if "%THREADS_TO_USE%"=="0" set "THREADS_TO_USE=%RECOMMENDED_THREAD_CAP%"',
+        'if %THREADS_TO_USE% GTR %NUMBER_OF_PROCESSORS% set "THREADS_TO_USE=%NUMBER_OF_PROCESSORS%"',
         'if not defined THREADS_TO_USE set "THREADS_TO_USE=1"',
         'if "%THREADS_TO_USE%"=="" set "THREADS_TO_USE=1"',
         'set "OMP_NUM_THREADS=%THREADS_TO_USE%"',
@@ -241,9 +267,13 @@ def write_case_files(case_dir: Path, case: Case, exe_path: Path) -> None:
         f'set "SOLVER_LOG=%CD%\\{log_name}"',
         "echo ===============================================================",
         f'echo Running case {case.run_id} in %CD%',
-        'echo Parallel processing enabled with %THREADS_TO_USE% threads',
+        'echo Parallel processing enabled with %THREADS_TO_USE% threads (auto cap=%RECOMMENDED_THREAD_CAP%)',
         'echo Live solver output will be shown in this console',
         'echo Solver log: %SOLVER_LOG%',
+        f'echo Adaptive composition mode: {case.flags.get("adaptive_comp_mode", "0")} (1=progress tracking)',
+        f'echo Stop checks required: {case.flags.get("stop_checks_required", "0")}/{case.flags.get("stop_checks_required", "0")}',
+        f'echo Composition report interval: {case.flags.get("comp_report_interval", "0")} steps',
+        'echo Intermediate XYZ/VTK dumps disabled; final XYZ and VTK will be written at completion',
         "echo ===============================================================",
         'if exist "%SOLVER_LOG%" del /q "%SOLVER_LOG%"',
         command_to_text(cmd_runtime_logged),

@@ -15,9 +15,11 @@ def read_xyz(path: Path) -> pd.DataFrame:
             if len(parts) < 5:
                 continue
             elem = parts[0]
-            x, y, z, a = map(float, parts[1:5])  # a is particle radius
-            rows.append((elem, x, y, z, a))
-    df = pd.DataFrame(rows, columns=["elem", "x", "y", "z", "a"])
+            # The solver writes diameter in the last XYZ column, so convert
+            # to radius here before computing any fill statistics.
+            x, y, z, diameter = map(float, parts[1:5])
+            rows.append((elem, x, y, z, 0.5 * diameter, diameter))
+    df = pd.DataFrame(rows, columns=["elem", "x", "y", "z", "a", "d"])
     df["r"] = np.sqrt(df["x"]**2 + df["y"]**2)
     return df
 

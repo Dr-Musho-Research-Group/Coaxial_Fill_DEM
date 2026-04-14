@@ -72,6 +72,7 @@
 
 // 0 => OpenMP default, 1 => serial, >1 => request that many threads (OpenMP)
 static int g_threads = 0;
+static int g_omp_min_particles = 512;
 
 static inline int effective_threads(){
 #if defined(_OPENMP)
@@ -85,6 +86,15 @@ static inline int effective_threads(){
 static inline void apply_thread_request(){
 #if defined(_OPENMP)
     if (g_threads > 0) omp_set_num_threads(g_threads);
+#endif
+}
+
+static inline bool should_parallelize(int n_items){
+#if defined(_OPENMP)
+    return (effective_threads() > 1) && (n_items >= g_omp_min_particles);
+#else
+    (void)n_items;
+    return false;
 #endif
 }
 
@@ -180,6 +190,8 @@ int   g_xyz_interval = -1;       // -1 => follow dump_interval
 int   g_vtk_interval = -1;       // -1 => follow dump_interval
 int   g_vtk_domain_interval = 0; // 0 => off
 int   g_vtk_domain_segments = 96; // cylinder tessellation
+int   g_dump_final_xyz = 0;      // 1 => write one last XYZ at exit/convergence
+int   g_dump_final_vtk = 0;      // 1 => write one last particle VTK at exit/convergence
 
 real g_Rin, g_Rout, g_L;
 int   g_flux;                  // spheres/sec
@@ -254,6 +266,8 @@ real g_tangent_damp = 0.85f;  // simple tangential vel damping
 // global linear velocity damping (optional)
 // Applies v <- v * exp(-lin_damp * dt) each step (0 disables).
 real g_lin_damp = 0.0; // [1/s]
+// Extra linear damping that is only activated after injection has completed.
+real g_post_fill_lin_damp = 0.0; // [1/s]
 
 // neighbor grid
 real g_cell_h;                // cell size ~ max_diam
@@ -318,6 +332,10 @@ static std::array<SizeDist,4> g_types = {};
 static real g_type_frac[4] = {0.4667, 0.2020, 0.2945, 0.0368};
 static real g_diameter_scale_factor = 1.0;
 static int  g_adaptive_composition = 1;
+// 0 => deficits vs final target volume (legacy adaptive behavior)
+// 1 => deficits vs current cumulative fill progress (helps avoid late catch-up)
+static int  g_adaptive_comp_mode = 0;
+static int  g_comp_report_interval = 0;
 
 // Optional: per-type density (defaults to global density)
 static real g_density_type[4] = {0,0,0,0}; // 0 => use g_density
@@ -584,6 +602,101 @@ inline int sample_type_fixed(std::mt19937& rng){
     return 3;
 }
 
+static inline real final_target_total_volume(real domVol, real totalVol_now){
+    if (g_phi_target > 0.0 && domVol > 0.0) return g_phi_target * domVol;
+    return totalVol_now;
+}
+
+static inline real adaptive_controller_target_total_volume(real domVol, real totalVol_now){
+    const real finalTargetTotalVol = final_target_total_volume(domVol, totalVol_now);
+    if (g_adaptive_comp_mode == 1) {
+        // Progress-tracking mode keeps the running composition near the requested
+        // mixture throughout the fill instead of only compensating near the end.
+        return (finalTargetTotalVol > 0.0)
+            ? std::min(totalVol_now, finalTargetTotalVol)
+            : totalVol_now;
+    }
+    return finalTargetTotalVol;
+}
+
+static inline void compute_adaptive_type_weights(real domVol,
+                                                 real totalVol_now,
+                                                 const std::array<real,4>& typeVol_now,
+                                                 std::array<real,4>& weights_out,
+                                                 real* targetTotalVol_used = nullptr){
+    weights_out = {0,0,0,0};
+    const real targetTotalVol = adaptive_controller_target_total_volume(domVol, totalVol_now);
+    if (targetTotalVol_used) *targetTotalVol_used = targetTotalVol;
+    if (targetTotalVol <= 0.0) return;
+
+    for (int itype = 0; itype < 4; ++itype) {
+        const real targetVol = g_type_frac[itype] * targetTotalVol;
+        const real deficit = targetVol - typeVol_now[itype];
+        if (deficit > 0.0) weights_out[itype] = deficit;
+    }
+}
+
+static inline const char* adaptive_comp_mode_name(){
+    return (g_adaptive_comp_mode == 1) ? "progress" : "final";
+}
+
+static void log_composition_status(const char* tag,
+                                   int it,
+                                   real t,
+                                   real domVol,
+                                   real totalVol_now,
+                                   const std::array<real,4>& typeVol_now,
+                                   const std::array<int,4>& typeCount_now){
+    std::array<real,4> currentFrac = {0,0,0,0};
+    std::array<real,4> nextWeights = {0,0,0,0};
+    std::array<real,4> nextFrac = {0,0,0,0};
+    std::array<real,4> mixErr = {0,0,0,0};
+    std::array<real,4> finalRemain = {0,0,0,0};
+    real nextTargetTotalVol = 0.0;
+
+    compute_adaptive_type_weights(domVol, totalVol_now, typeVol_now, nextWeights, &nextTargetTotalVol);
+
+    real nextWsum = 0.0;
+    real finalRemainSum = 0.0;
+    const real finalTargetTotalVol = final_target_total_volume(domVol, totalVol_now);
+    for (int itype = 0; itype < 4; ++itype) {
+        if (totalVol_now > 0.0) {
+            currentFrac[itype] = typeVol_now[itype] / totalVol_now;
+        }
+        mixErr[itype] = currentFrac[itype] - g_type_frac[itype];
+        nextWsum += nextWeights[itype];
+
+        if (finalTargetTotalVol > 0.0) {
+            const real targetVol = g_type_frac[itype] * finalTargetTotalVol;
+            finalRemain[itype] = std::max((real)0.0, targetVol - typeVol_now[itype]);
+            finalRemainSum += finalRemain[itype];
+        }
+    }
+
+    if (nextWsum > 0.0) {
+        for (int itype = 0; itype < 4; ++itype) nextFrac[itype] = nextWeights[itype] / nextWsum;
+    } else {
+        for (int itype = 0; itype < 4; ++itype) nextFrac[itype] = g_type_frac[itype];
+    }
+
+    if (finalRemainSum > 0.0) {
+        for (int itype = 0; itype < 4; ++itype) finalRemain[itype] /= finalRemainSum;
+    }
+
+    const real phi_now = (domVol > 0.0 ? totalVol_now / domVol : 0.0);
+    log_printf("[%s] it=%d t=%.3g phi=%.3f mode=%s counts=(%d,%d,%d,%d) volFrac=(%.3f,%.3f,%.3f,%.3f)\n",
+               tag, it, t, phi_now, adaptive_comp_mode_name(),
+               typeCount_now[0], typeCount_now[1], typeCount_now[2], typeCount_now[3],
+               currentFrac[0], currentFrac[1], currentFrac[2], currentFrac[3]);
+    log_printf("[%s-next] target=(%.3f,%.3f,%.3f,%.3f) err=(%+.3f,%+.3f,%+.3f,%+.3f) next=(%.3f,%.3f,%.3f,%.3f) finalRemain=(%.3f,%.3f,%.3f,%.3f)\n",
+               tag,
+               g_type_frac[0], g_type_frac[1], g_type_frac[2], g_type_frac[3],
+               mixErr[0], mixErr[1], mixErr[2], mixErr[3],
+               nextFrac[0], nextFrac[1], nextFrac[2], nextFrac[3],
+               finalRemain[0], finalRemain[1], finalRemain[2], finalRemain[3]);
+    (void)nextTargetTotalVol;
+}
+
 inline int sample_type_adaptive(std::mt19937& rng,
                                 real domVol,
                                 real totalVol_now,
@@ -591,24 +704,10 @@ inline int sample_type_adaptive(std::mt19937& rng,
     if (!g_adaptive_composition) return sample_type_fixed(rng);
 
     std::array<real,4> weights = {0,0,0,0};
+    compute_adaptive_type_weights(domVol, totalVol_now, typeVol_now, weights);
+
     real wsum = 0.0;
-
-    // If phi_target is active, steer toward the final requested per-species occupied volumes.
-    // Otherwise, steer toward the instantaneous mixture implied by the requested fractions.
-    const real targetTotalVol = (g_phi_target > 0.0 && domVol > 0.0)
-        ? (g_phi_target * domVol)
-        : totalVol_now;
-
-    if (targetTotalVol > 0.0) {
-        for (int itype = 0; itype < 4; ++itype) {
-            const real targetVol = g_type_frac[itype] * targetTotalVol;
-            const real deficit = targetVol - typeVol_now[itype];
-            if (deficit > 0.0) {
-                weights[itype] = deficit;
-                wsum += deficit;
-            }
-        }
-    }
+    for (int itype = 0; itype < 4; ++itype) wsum += weights[itype];
 
     if (wsum <= 0.0) return sample_type_fixed(rng);
 
@@ -674,7 +773,7 @@ static inline void successive_damping(std::vector<Particle>& P, real top_z)
         const real alpha = g_sd_alpha0 + (g_sd_alpha1 - g_sd_alpha0) * w; // ramp up
         const real keep  = clamp_val<real>(1.0 - alpha, (real)0.0, (real)1.0);
 #if defined(_OPENMP)
-        #pragma omp parallel for
+        #pragma omp parallel for if(should_parallelize((int)P.size()))
         for (int i = 0; i < (int)P.size(); ++i) {
             auto &a = P[i];
             if (a.asleep) continue;       // don’t touch sleepers
@@ -819,9 +918,23 @@ inline bool injection_radius_fits(real rp){
 inline Vec3 worldMin(){ return g_minB; }
 inline int  idx3(int ix,int iy,int iz){ return (iz*gy + iy)*gx + ix; }
 
+// One grid cell plus its integer coordinates.
+// We precompute color groups once because the grid dimensions are fixed.
+struct GridCellTask {
+    int h;
+    int ix;
+    int iy;
+    int iz;
+};
+
+inline void collide_pair(Particle& A, Particle& B, real e_common, real tdamp);
+
 void rebuild_grid(const std::vector<Particle>& P,
                   std::vector<int>& head,
-                  std::vector<int>& next)
+                  std::vector<int>& next,
+                  std::vector<int>& cell_ix,
+                  std::vector<int>& cell_iy,
+                  std::vector<int>& cell_iz)
 {
     std::fill(head.begin(), head.end(), -1);
     for (int i=0;i<(int)P.size();++i){
@@ -830,10 +943,123 @@ void rebuild_grid(const std::vector<Particle>& P,
         int iy = (int)std::floor((a.p.y - g_minB.y)/g_cell_h);
         int iz = (int)std::floor((a.p.z - g_minB.z)/g_cell_h);
         ix = clampi(ix,0,gx-1); iy = clampi(iy,0,gy-1); iz = clampi(iz,0,gz-1);
+        cell_ix[i] = ix;
+        cell_iy[i] = iy;
+        cell_iz[i] = iz;
         int h = idx3(ix,iy,iz);
         next[i] = head[h];
         head[h] = i;
     }
+}
+
+// Resolve pair contacts using a 3x3x3 cell-color sweep.
+//
+// Why this helps:
+// - Cells with the same (ix mod 3, iy mod 3, iz mod 3) color are separated by at
+//   least one full cell in every direction, so their 27-cell neighborhoods do not overlap.
+// - That means each color can be processed in parallel while still updating particle
+//   state in place, preserving the existing collision model without cross-thread races.
+// - We only visit a forward half-neighborhood so each particle pair is resolved once.
+static inline void collide_pairs_colored(
+    std::vector<Particle>& P,
+    const std::vector<int>& head,
+    const std::vector<int>& next,
+    const std::vector<std::vector<GridCellTask>>& cells_by_color,
+    real e_common,
+    real tdamp)
+{
+    static const int kHalfStencil[14][3] = {
+        { 0,  0,  0},
+        { 1,  0,  0},
+        {-1,  1,  0}, { 0,  1,  0}, { 1,  1,  0},
+        {-1, -1,  1}, { 0, -1,  1}, { 1, -1,  1},
+        {-1,  0,  1}, { 0,  0,  1}, { 1,  0,  1},
+        {-1,  1,  1}, { 0,  1,  1}, { 1,  1,  1},
+    };
+
+#if defined(_OPENMP)
+    const bool use_omp = should_parallelize((int)P.size());
+    #pragma omp parallel if(use_omp)
+    {
+        for (int color = 0; color < (int)cells_by_color.size(); ++color) {
+            const auto& tasks = cells_by_color[color];
+            #pragma omp for schedule(static)
+            for (int task_idx = 0; task_idx < (int)tasks.size(); ++task_idx) {
+                const GridCellTask& cell = tasks[task_idx];
+                if (head[cell.h] == -1) continue;
+
+                for (int s = 0; s < 14; ++s) {
+                    const int dx = kHalfStencil[s][0];
+                    const int dy = kHalfStencil[s][1];
+                    const int dz = kHalfStencil[s][2];
+
+                    const int jx = cell.ix + dx;
+                    const int jy = cell.iy + dy;
+                    const int jz = cell.iz + dz;
+                    if (jx < 0 || jx >= gx || jy < 0 || jy >= gy || jz < 0 || jz >= gz) continue;
+
+                    const int nh = idx3(jx, jy, jz);
+                    if (head[nh] == -1) continue;
+
+                    if (dx == 0 && dy == 0 && dz == 0) {
+                        for (int i = head[cell.h]; i != -1; i = next[i]) {
+                            for (int j = next[i]; j != -1; j = next[j]) {
+                                if (P[i].asleep && P[j].asleep) continue;
+                                collide_pair(P[i], P[j], e_common, tdamp);
+                            }
+                        }
+                    } else {
+                        for (int i = head[cell.h]; i != -1; i = next[i]) {
+                            for (int j = head[nh]; j != -1; j = next[j]) {
+                                if (P[i].asleep && P[j].asleep) continue;
+                                collide_pair(P[i], P[j], e_common, tdamp);
+                            }
+                        }
+                    }
+                }
+            }
+            #pragma omp barrier
+        }
+    }
+#else
+    for (int color = 0; color < (int)cells_by_color.size(); ++color) {
+        const auto& tasks = cells_by_color[color];
+        for (int task_idx = 0; task_idx < (int)tasks.size(); ++task_idx) {
+            const GridCellTask& cell = tasks[task_idx];
+            if (head[cell.h] == -1) continue;
+
+            for (int s = 0; s < 14; ++s) {
+                const int dx = kHalfStencil[s][0];
+                const int dy = kHalfStencil[s][1];
+                const int dz = kHalfStencil[s][2];
+
+                const int jx = cell.ix + dx;
+                const int jy = cell.iy + dy;
+                const int jz = cell.iz + dz;
+                if (jx < 0 || jx >= gx || jy < 0 || jy >= gy || jz < 0 || jz >= gz) continue;
+
+                const int nh = idx3(jx, jy, jz);
+                if (head[nh] == -1) continue;
+
+                if (dx == 0 && dy == 0 && dz == 0) {
+                    for (int i = head[cell.h]; i != -1; i = next[i]) {
+                        for (int j = next[i]; j != -1; j = next[j]) {
+                            if (P[i].asleep && P[j].asleep) continue;
+                            collide_pair(P[i], P[j], e_common, tdamp);
+                        }
+                    }
+                } else {
+                    for (int i = head[cell.h]; i != -1; i = next[i]) {
+                        for (int j = head[nh]; j != -1; j = next[j]) {
+                            if (P[i].asleep && P[j].asleep) continue;
+                            collide_pair(P[i], P[j], e_common, tdamp);
+                        }
+                    }
+                }
+            }
+        }
+    }
+#endif
 }
 
 // --------------------- Repulsive forces (optional) ---------------------
@@ -848,7 +1074,11 @@ void rebuild_grid(const std::vector<Particle>& P,
 static inline void apply_repulsion_accel(std::vector<Particle>& P,
                                         const std::vector<int>& head,
                                         const std::vector<int>& next,
-                                        real top_z)
+                                        const std::vector<int>& cell_ix,
+                                        const std::vector<int>& cell_iy,
+                                        const std::vector<int>& cell_iz,
+                                        real top_z,
+                                        std::vector<Vec3>& acc)
 {
     if (g_repulse_range <= 0.0) return;
     const bool use_pp = (g_repulse_k_pp > 0.0);
@@ -859,19 +1089,24 @@ static inline void apply_repulsion_accel(std::vector<Particle>& P,
     const real range = g_repulse_range;
 
     // Accumulate per-particle accelerations to avoid races.
-    std::vector<Vec3> acc(P.size(), Vec3{0,0,0});
+    if ((int)acc.size() < (int)P.size()) acc.resize(P.size());
+#if defined(_OPENMP)
+    #pragma omp parallel for if(should_parallelize((int)P.size()))
+#endif
+    for (int i = 0; i < (int)P.size(); ++i) {
+        acc[i] = Vec3{0,0,0};
+    }
 
     if (use_pp) {
         const real kpp = g_repulse_k_pp;
 
 #if defined(_OPENMP)
-        #pragma omp parallel for schedule(static)
+        #pragma omp parallel for schedule(static) if(should_parallelize((int)P.size()))
 #endif
         for (int i = 0; i < (int)P.size(); ++i) {
-            // compute i's cell
-            int ix = clampi(int(std::floor((P[i].p.x - g_minB.x)/g_cell_h)), 0, gx-1);
-            int iy = clampi(int(std::floor((P[i].p.y - g_minB.y)/g_cell_h)), 0, gy-1);
-            int iz = clampi(int(std::floor((P[i].p.z - g_minB.z)/g_cell_h)), 0, gz-1);
+            const int ix = cell_ix[i];
+            const int iy = cell_iy[i];
+            const int iz = cell_iz[i];
 
             for (int dz=-1; dz<=1; ++dz){
                 int jz = clampi(iz+dz,0,gz-1);
@@ -944,7 +1179,7 @@ static inline void apply_repulsion_accel(std::vector<Particle>& P,
     if (use_pw) {
         const real kpw = g_repulse_k_pw;
 #if defined(_OPENMP)
-        #pragma omp parallel for
+        #pragma omp parallel for if(should_parallelize((int)P.size()))
 #endif
         for (int i = 0; i < (int)P.size(); ++i) {
             const Particle& a = P[i];
@@ -1042,7 +1277,7 @@ static inline void apply_repulsion_accel(std::vector<Particle>& P,
 
     // Apply accumulated accelerations
 #if defined(_OPENMP)
-    #pragma omp parallel for
+    #pragma omp parallel for if(should_parallelize((int)P.size()))
 #endif
     for (int i = 0; i < (int)P.size(); ++i) {
         if (!P[i].asleep) {
@@ -1438,16 +1673,18 @@ int main(int argc, char** argv){
             "     [--flux N] [--gravity G] [--shake_hz HZ] [--shake_amp A]\n"
             "     [--fill_time T] [--ram_start T0] [--ram_duration DT] [--ram_speed V]\n"
             "     [--phi_target PHI]\n"
-            "     [--adaptive_composition 0|1]\n"
+            "     [--adaptive_composition 0|1] [--adaptive_comp_mode 0|1]\n"
             "     [--repulse_range R] [--repulse_k_pp K] [--repulse_k_pw K] [--repulse_use_mass 0|1] [--repulse_dvmax V]\n"
             "     [--stop_vrms V] [--stop_vmax V] [--stop_sleep_frac F]\n"
             "     [--stop_check_interval N] [--stop_checks_required N]\n"
-            "     [--lin_damp D] [--e_pp E] [--e_pw E] [--tangent_damp D]\n"
+            "     [--lin_damp D] [--post_fill_lin_damp D] [--e_pp E] [--e_pw E] [--tangent_damp D]\n"
 
             "     [--wall_rough_amp A] [--wall_rough_mth M] [--wall_rough_mz M]\n"
-            "     [--threads N]\n"
+            "     [--threads N] [--omp_min_particles N]\n"
+            "     [--comp_report_interval N]\n"
             "     [--log_file PATH]\n"
-            "     [--xyz_interval N] [--vtk_interval N] [--vtk_domain_interval N] [--vtk_domain_segments N]\n",
+            "     [--xyz_interval N] [--vtk_interval N] [--vtk_domain_interval N] [--vtk_domain_segments N]\n"
+            "     [--dump_final_xyz 0|1] [--dump_final_vtk 0|1]\n",
             argv[0], argv[0]);
         return rc;
     };
@@ -1480,6 +1717,7 @@ int main(int argc, char** argv){
     g_wall_dvmax = 5.0;
 
     g_lin_damp = 0.0; // [1/s]
+    g_post_fill_lin_damp = 0.0; // [1/s]
 
     g_repulse_range = 0.0;
     g_repulse_k_pp  = 0.0;
@@ -1505,6 +1743,7 @@ int main(int argc, char** argv){
     g_phi_target = 0.0;
     g_diameter_scale_factor = 1.0;
     g_adaptive_composition = 1;
+    g_adaptive_comp_mode = 0;
 
     g_stop_vrms = 0.0;
     g_stop_vmax = 0.0;
@@ -1513,10 +1752,14 @@ int main(int argc, char** argv){
     g_stop_checks_required = 10;
 
     g_threads = 0;
+    g_omp_min_particles = 512;
+    g_comp_report_interval = 0;
     g_xyz_interval = -1;
     g_vtk_interval = -1;
     g_vtk_domain_interval = 0;
     g_vtk_domain_segments = 96;
+    g_dump_final_xyz = 0;
+    g_dump_final_vtk = 0;
 
     if (argc <= 1) return usage(1);
 
@@ -1622,6 +1865,8 @@ int main(int argc, char** argv){
         get_r("wall_dvmax", g_wall_dvmax);
 
         get_r("lin_damp", g_lin_damp);
+        get_r("post_fill_lin_damp", g_post_fill_lin_damp);
+        get_r("postfill_lin_damp", g_post_fill_lin_damp);
         get_r("e_pp", g_e_pp);
         get_r("e_pw", g_e_pw);
         get_r("tangent_damp", g_tangent_damp);
@@ -1644,6 +1889,8 @@ int main(int argc, char** argv){
         get_r("dsf", g_diameter_scale_factor);
         get_i("adaptive_composition", g_adaptive_composition);
         get_i("adaptive_comp", g_adaptive_composition);
+        get_i("adaptive_comp_mode", g_adaptive_comp_mode);
+        get_i("composition_mode", g_adaptive_comp_mode);
         get_s("log_file", g_log_file_path);
 
         get_r("f_la", g_type_frac[0]);
@@ -1665,11 +1912,18 @@ int main(int argc, char** argv){
 
         get_i("threads", g_threads);
         get_i("nthreads", g_threads);
+        get_i("omp_min_particles", g_omp_min_particles);
+        get_i("omp_min_n", g_omp_min_particles);
+        get_i("comp_report_interval", g_comp_report_interval);
 
         get_i("xyz_interval", g_xyz_interval);
         get_i("vtk_interval", g_vtk_interval);
         get_i("vtk_domain_interval", g_vtk_domain_interval);
         get_i("vtk_domain_segments", g_vtk_domain_segments);
+        get_i("dump_final_xyz", g_dump_final_xyz);
+        get_i("final_xyz", g_dump_final_xyz);
+        get_i("dump_final_vtk", g_dump_final_vtk);
+        get_i("final_vtk", g_dump_final_vtk);
 
         // accept some aliases from older batch scripts
         get_r("r_in", g_Rin);
@@ -1707,6 +1961,9 @@ int main(int argc, char** argv){
 #if defined(_OPENMP)
     if (g_threads > 0) omp_set_num_threads(g_threads);
 #endif
+    if (g_omp_min_particles < 0) g_omp_min_particles = 0;
+    if (g_adaptive_comp_mode < 0 || g_adaptive_comp_mode > 1) g_adaptive_comp_mode = 0;
+    if (g_comp_report_interval < 0) g_comp_report_interval = 0;
 
     // resolve output intervals (default: follow dump_interval)
     if (g_xyz_interval < 0) g_xyz_interval = g_dump_interval;
@@ -1760,12 +2017,26 @@ init_default_distributions_once();
     // neighbor grid buffers
     std::vector<int> head(gx*gy*gz,-1);
     std::vector<int> next(g_natoms_max, -1);
+    std::vector<int> cell_ix(g_natoms_max, 0);
+    std::vector<int> cell_iy(g_natoms_max, 0);
+    std::vector<int> cell_iz(g_natoms_max, 0);
+    std::vector<Vec3> repulse_acc(g_natoms_max, Vec3{0,0,0});
+    std::vector<std::vector<GridCellTask>> cells_by_color(27);
+    for (int iz = 0; iz < gz; ++iz) {
+        for (int iy = 0; iy < gy; ++iy) {
+            for (int ix = 0; ix < gx; ++ix) {
+                const int color = (ix % 3) + 3 * (iy % 3) + 9 * (iz % 3);
+                cells_by_color[color].push_back(GridCellTask{idx3(ix, iy, iz), ix, iy, iz});
+            }
+        }
+    }
 
     // domain volume (constant) for phi
     const real domVol = M_PI * (g_Rout*g_Rout - g_Rin*g_Rin) * g_L;
     // running particle-volume accumulator (O(1) update on injection)
     real totalVol_running = 0.0;
     std::array<real,4> typeVol_running = {0,0,0,0};
+    std::array<int,4>  typeCount_running = {0,0,0,0};
 
     // piston kinematics
     auto topPlane = [&](real t)->real{
@@ -1781,12 +2052,16 @@ init_default_distributions_once();
     // injection book-keeping
     int injected_total = 0;
     real t = 0.0;
+    int final_iter = 0;
+    int last_xyz_dump_iter = -1;
+    int last_vtk_dump_iter = -1;
 
     log_printf("Coax pack: Rin=%.4g m Rout=%.4g m L=%.4g m, fill_time=%.2fs, flux=%d 1/s\n",
                 g_Rin, g_Rout, g_L, g_fill_time, g_flux);
     log_printf("Diameter scale factor=%.6g | Fractions (La,Sr,Fe,Co)=(%.6g, %.6g, %.6g, %.6g)\n",
                 g_diameter_scale_factor, g_type_frac[0], g_type_frac[1], g_type_frac[2], g_type_frac[3]);
-    log_printf("Adaptive composition control=%d\n", g_adaptive_composition ? 1 : 0);
+    log_printf("Adaptive composition control=%d mode=%s | comp_report_interval=%d\n",
+                g_adaptive_composition ? 1 : 0, adaptive_comp_mode_name(), g_comp_report_interval);
 
     for (int it=0; it<=g_niter; ++it, t += g_dt){
         // 1) Inject new spheres while t < fill_time
@@ -1801,13 +2076,14 @@ init_default_distributions_once();
                 g_ram_speed = 0.0;     // freeze top lid motion
                 g_ram_dt = 0.0;
                 // wake everyone once so they can relax to rest under zero-g + damping
-                #pragma omp parallel for
+                #pragma omp parallel for if(should_parallelize((int)P.size()))
                 for (int i = 0; i < (int)P.size(); ++i) {
                     P[i].asleep = false;
                     P[i].calm_steps = 0;
                 }
                 if (g_debug) log_printf("[phi-cutoff] target=%.5f reached at t=%.6g (N=%zu)\n",
                                           g_phi_target, t, P.size());
+                if (g_debug) log_composition_status("comp-cutoff", it, t, domVol, totalVol_running, typeVol_running, typeCount_running);
             }
         }
 
@@ -1867,7 +2143,7 @@ init_default_distributions_once();
                 }
                 // Per-thread RNGs to avoid races and XY bias
 #if defined(_OPENMP)
-                #pragma omp parallel
+                #pragma omp parallel if(should_parallelize(want))
                 {
                     const int tid = omp_get_thread_num();
                     std::mt19937 trng((unsigned)g_seed + 0x9E3779B9u * (unsigned)tid + (unsigned)it*101u);
@@ -1929,7 +2205,10 @@ init_default_distributions_once();
                     const real vol = sphere_volume_from_radius(r);
                     totalVol_running += vol;
                     const int t_id = (int)P[k].type_id;
-                    if (t_id >= 0 && t_id < 4) typeVol_running[t_id] += vol;
+                    if (t_id >= 0 && t_id < 4) {
+                        typeVol_running[t_id] += vol;
+                        typeCount_running[t_id] += 1;
+                    }
                 }
             }
         }
@@ -1959,18 +2238,19 @@ init_default_distributions_once();
         }
 
         // 2) rebuild neighbor grid
-        rebuild_grid(P, head, next);
+        rebuild_grid(P, head, next, cell_ix, cell_iy, cell_iz);
 
         // ------------------------------------------------------------------
         // (A) — wake logic BEFORE collisions so sleepers can participate
         // ------------------------------------------------------------------
         // Compute current top plane position (reuse later)
         real zTop_now = topPlane(t);
+        final_iter = it;
         g_piston_wall_vn = ((t >= g_ram_t0) && (t <= (g_ram_t0 + g_ram_dt)) ? g_ram_speed : 0.0);
         {
             // Wake everyone during the ram window (simple, robust)
             if (t >= g_ram_t0 && t <= (g_ram_t0 + g_ram_dt)) {
-                #pragma omp parallel for
+                #pragma omp parallel for if(should_parallelize((int)P.size()))
                 for (int i=0; i<(int)P.size(); ++i) {
                     P[i].asleep = false;
                     P[i].calm_steps = 0;
@@ -1984,7 +2264,7 @@ init_default_distributions_once();
             if (zTop_now < prevTop - 1e-15) piston_down = true;
             prevTop = zTop_now;
             if (piston_down) {
-                #pragma omp parallel for
+                #pragma omp parallel for if(should_parallelize((int)P.size()))
                 for (int i=0; i<(int)P.size(); ++i) {
                     if (P[i].asleep && P[i].p.z > (zTop_now - g_wake_band * P[i].r)) {
                         P[i].asleep = false; P[i].calm_steps = 0;
@@ -1993,36 +2273,16 @@ init_default_distributions_once();
             }
         }
 
-        // 4) pairwise collisions via neighbor search (particle-driven, not cell-scan)
-        #pragma omp parallel for schedule(static)
-        for (int i=0; i<(int)P.size(); ++i){
-            // compute i's cell
-            int ix = clampi(int(std::floor((P[i].p.x - g_minB.x)/g_cell_h)), 0, gx-1);
-            int iy = clampi(int(std::floor((P[i].p.y - g_minB.y)/g_cell_h)), 0, gy-1);
-            int iz = clampi(int(std::floor((P[i].p.z - g_minB.z)/g_cell_h)), 0, gz-1);
-
-            for (int dz=-1; dz<=1; ++dz){
-                int jz = clampi(iz+dz,0,gz-1);
-                for (int dy=-1; dy<=1; ++dy){
-                    int jy = clampi(iy+dy,0,gy-1);
-                    for (int dx=-1; dx<=1; ++dx){
-                        int jx = clampi(ix+dx,0,gx-1);
-                        int h = idx3(jx,jy,jz);
-                        for (int j=head[h]; j!=-1; j=next[j]){
-                            if (j<=i) continue;
-                            if (P[i].asleep && P[j].asleep) continue;
-                            collide_pair(P[i], P[j], g_e_pp, g_tangent_damp);
-                        }
-                    }
-                }
-            }
-        }
+        // 4) pairwise collisions via a colored cell sweep.
+        // This keeps the contact model unchanged while avoiding concurrent updates
+        // to the same particle from different threads.
+        collide_pairs_colored(P, head, next, cells_by_color, g_e_pp, g_tangent_damp);
 
         // 4.9) set accelerations for this step: gravity + shaking-frame accel
         real a_shake_x=0.0, a_shake_y=0.0, a_shake_z=0.0;
         shake_accels(t, a_shake_x, a_shake_y, a_shake_z);
 #if defined(_OPENMP)
-        #pragma omp parallel for
+        #pragma omp parallel for if(should_parallelize((int)P.size()))
         for (int i=0; i<(int)P.size(); ++i){
             auto &a = P[i];
             // reset
@@ -2053,14 +2313,20 @@ init_default_distributions_once();
 
         // 4.95) optional short-range repulsive accelerations (pp + walls)
         // Note: uses the already-built neighbor grid.
-        apply_repulsion_accel(P, head, next, zTop_now);
+        apply_repulsion_accel(P, head, next, cell_ix, cell_iy, cell_iz, zTop_now, repulse_acc);
 
         // 5) integrate (Velocity Verlet: here simple symplectic Euler style for brevity)
         real zTop = zTop_now;
-        const real v_damp_fac = (g_lin_damp > 0.0 ? std::exp(-g_lin_damp * g_dt) : 1.0);
+        const bool injection_complete =
+            g_phi_reached || (t >= g_fill_time) || (injected_total >= g_natoms_max) || (g_flux <= 0);
+        real lin_damp_now = g_lin_damp;
+        if (injection_complete && g_post_fill_lin_damp > 0.0) {
+            lin_damp_now += g_post_fill_lin_damp;
+        }
+        const real v_damp_fac = (lin_damp_now > 0.0 ? std::exp(-lin_damp_now * g_dt) : 1.0);
 
 #if defined(_OPENMP)
-        #pragma omp parallel for
+        #pragma omp parallel for if(should_parallelize((int)P.size()))
         for (int i=0;i<(int)P.size();++i){
             auto &a = P[i];
             if (!a.asleep) {
@@ -2182,7 +2448,7 @@ init_default_distributions_once();
                 real vmax = 0.0;
                 int asleep_count = 0;
 
-                #pragma omp parallel for reduction(+:sumv2,asleep_count) reduction(max:vmax)
+                #pragma omp parallel for reduction(+:sumv2,asleep_count) reduction(max:vmax) if(should_parallelize((int)P.size()))
                 for (int i=0; i<(int)P.size(); ++i) {
                     const Particle& a = P[i];
                     if (a.asleep) asleep_count++;
@@ -2205,6 +2471,7 @@ init_default_distributions_once();
                 if (g_debug) {
                     log_printf("[stop-check] it=%d t=%.3g vrms=%.3g vmax=%.3g asleep=%.3f ok=%d (%d/%d)\n",
                                 it, t, vrms, vmax, sleep_frac, ok?1:0, ok_checks, g_stop_checks_required);
+                    log_composition_status("comp-stop", it, t, domVol, totalVol_running, typeVol_running, typeCount_running);
                 }
 
                 if (ok_checks >= std::max(1, g_stop_checks_required)) {
@@ -2221,12 +2488,18 @@ init_default_distributions_once();
              (g_vtk_interval>0 && (it % g_vtk_interval) == 0) ||
              (g_vtk_domain_interval>0 && (it % g_vtk_domain_interval) == 0) ){
             if (!P.empty()){
-                if (g_xyz_interval > 0 && (it % g_xyz_interval)==0) dump_xyz(P, it);
-                if (g_vtk_interval > 0 && (it % g_vtk_interval)==0) dump_vtk(P, it);
+                if (g_xyz_interval > 0 && (it % g_xyz_interval)==0) {
+                    dump_xyz(P, it);
+                    last_xyz_dump_iter = it;
+                }
+                if (g_vtk_interval > 0 && (it % g_vtk_interval)==0) {
+                    dump_vtk(P, it);
+                    last_vtk_dump_iter = it;
+                }
                 if (g_vtk_domain_interval > 0 && (it % g_vtk_domain_interval)==0) dump_domain_vtk(zTop_now, it);
             }
             real E=0.0, sumz=0.0;
-            #pragma omp parallel for reduction(+:E,sumz)
+            #pragma omp parallel for reduction(+:E,sumz) if(should_parallelize((int)P.size()))
             for (int i=0;i<(int)P.size();++i){
                 E += 0.5*P[i].m*dot(P[i].v,P[i].v);
                 sumz += P[i].p.z;
@@ -2235,9 +2508,24 @@ init_default_distributions_once();
             phi = (domVol > 0.0 ? totalVol_running / domVol : 0.0);
             log_printf("it=%d t=%.3g N=%zu topZ=%.4g avgZ=%.4g phi=%6.3f\n",
                 it, t, P.size(), zTop, P.empty()?0.0:real(sumz/P.size()),phi);
+            if (g_debug) {
+                log_composition_status("comp", it, t, domVol, totalVol_running, typeVol_running, typeCount_running);
+            }
+        } else if (g_debug && g_comp_report_interval > 0 && (it % g_comp_report_interval) == 0 && !P.empty()) {
+            log_composition_status("comp", it, t, domVol, totalVol_running, typeVol_running, typeCount_running);
         }
     }
 
+    phi = (domVol > 0.0 ? totalVol_running / domVol : 0.0);
+    if (g_dump_final_xyz && !P.empty() && last_xyz_dump_iter != final_iter) {
+        dump_xyz(P, final_iter);
+    }
+    if (g_dump_final_vtk && !P.empty() && last_vtk_dump_iter != final_iter) {
+        dump_vtk(P, final_iter);
+    }
+    if (g_debug && !P.empty()) {
+        log_composition_status("comp-final", final_iter, t, domVol, totalVol_running, typeVol_running, typeCount_running);
+    }
     log_printf("Done. Injected=%d, final N=%zu, phi=%6.3f\n", injected_total, P.size(), phi);
     if (g_run_log) {
         std::fclose(g_run_log);
